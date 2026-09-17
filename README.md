@@ -1,9 +1,8 @@
 # fast-jev-compaction
 
-Claude Code plugin that replaces the compaction summary with Jev decisions:
-every tool call and result is scored in one fast request, stale ones are
-dropped or truncated, everything kept stays verbatim. Also usable as an npm
-library.
+Claude Code plugin and Pi package that use Jev decisions to remove or truncate
+stale tool calls and results while keeping everything else verbatim. Also
+usable as an npm library.
 
 ## What and why
 
@@ -124,6 +123,99 @@ stage was needed, and the number of requests.
   result is safe to delete. The assistant can always re-run the tool.
 - The full state is repeated with every request, so a history near the state
   ceiling costs one request per handful of questions.
+
+## Pi extension
+
+The Pi package exposes `pi/extension.ts` through its `package.json` manifest.
+It uses Pi's `context` hook to create a pruned copy only for the next model
+request. It does not replace session entries: the JSONL session still contains
+the complete original conversation, and a cached pruning decision is saved as
+a branch-scoped custom entry so it can be restored after a reload or `/tree`
+navigation.
+
+Pi's own `/compact`, automatic compaction, overflow recovery, and branch
+summaries remain native Pi behavior. This extension does not supply a custom
+compaction summary. If Jev is unavailable, a request is cancelled, a response
+is malformed, or a stored decision no longer matches the active transcript,
+the extension forwards the original context and Pi keeps its usual compaction
+fallback available.
+
+Only a complete, one-to-one tool-call/result pair is eligible. The adapter
+pins the first row and the configured recent rows, and refuses to edit rows
+with images, errors, thinking blocks, signatures, non-text/multi-part results,
+or tool-discovery metadata. It also keeps a call and its result paired. These
+guards are deliberate: a decision that cannot be replayed without changing
+Pi's message structure is discarded instead of partially applied.
+
+### Privacy and API data
+
+Jev receives conversation text, Pi compaction and branch summaries, non-excluded
+`!` bash commands, and tool names and arguments (including protected calls).
+For scoring, every tool output body is replaced with a short length/status
+note; output bodies are not sent to the TypeSafe API. A `!!` bash execution
+marked `excludeFromContext` is omitted from the scoring input. Set
+`TYPESAFE_API_KEY` only if that text, those summaries, commands, and tool
+arguments may be sent to TypeSafe.
+
+The status line may report `~N tokens removed`. That is an approximate context
+size estimate based on the message content forwarded to Pi, not a tokenizer
+measurement or a claim about response time.
+
+### Install
+
+The npm library supports Node 18 and newer. Pi 0.85.1 requires Node 22.19 or
+newer, so use that version when loading the Pi extension.
+
+After this change is merged upstream:
+
+```sh
+pi install git:github.com/tamaratran/fast-jev-compaction
+```
+
+To run the extension directly from a local checkout:
+
+```sh
+pi -e ./pi/extension.ts
+```
+
+To install the fork branch before the upstream merge:
+
+```sh
+pi install git:github.com/MiguelMachado-dev/fast-jev-compaction@feat/pi-extension
+```
+
+Set `TYPESAFE_API_KEY` in the environment that starts Pi. Without a key the
+extension is inert, leaves context unchanged, and `/jev status` reports that
+the key is missing.
+
+### Configuration
+
+Pi loads these extension flags from the command line:
+
+| Flag | Default | Meaning |
+| --- | ---: | --- |
+| `--jev-min-tokens` | `20000` | Approximate context size that enables automatic scoring. |
+| `--jev-preserve-recent` | `6` | Newest message rows that are never edited. |
+| `--jev-timeout-ms` | `10000` | Deadline for one complete scoring pass, from 1 to 120000 ms. |
+| `--jev-keep-threshold` | `0.5` | Minimum Jev probability required to keep a call or full result, from 0 to 1. |
+| `--jev-disabled` | `false` | Starts the extension disabled. |
+
+For example: `pi --jev-min-tokens 24000 --jev-preserve-recent 8`.
+
+Use the `/jev` command inside Pi:
+
+| Command | Effect |
+| --- | --- |
+| `/jev status` | Shows whether pruning can run, whether a key is configured, and the cached edit count. |
+| `/jev prune` | Queues a forced rescore for the next model request; it does not make an LLM request by itself. |
+| `/jev on` / `/jev off` | Enables or disables automatic pruning for the active branch. |
+| `/jev reset` / `/jev restore` | Clears cached edits and keeps automatic pruning enabled if it was enabled. |
+
+After a successful score, the extension reuses the same edits until a new user
+prompt arrives, eight new message rows appear, or `/jev prune` forces a new
+score. `/tree` navigation restores the cached edits for the newly active
+branch. Native Pi compaction, malformed persisted state, and configuration
+changes invalidate a cache.
 
 ## Claude Code plugin
 
