@@ -1,10 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { SessionManager, sessionEntryToContextMessages } from '@earendil-works/pi-coding-agent';
+import type { AgentMessage } from '@earendil-works/pi-agent-core';
+
 type AnyRecord = Record<string, any>;
 type Handler = (event: AnyRecord, ctx: AnyRecord) => Promise<unknown> | unknown;
 type Command = { description?: string; handler: (args: string, ctx: AnyRecord) => Promise<void> | void };
 
 interface Harness {
+  session: SessionManager;
   pi: AnyRecord;
   ctx: AnyRecord;
   handlers: Map<string, Handler>;
@@ -12,118 +16,130 @@ interface Harness {
   commands: Map<string, Command>;
   appended: AnyRecord[];
   setFlag(name: string, value: string | boolean | undefined): void;
-  setBranch(entries: AnyRecord[], leafId?: string | null): void;
-  branch(): AnyRecord[];
-  leaf(): string | null;
 }
 
 const usage = {
-  input: 1,
-  output: 1,
+  input: 11,
+  output: 7,
   cacheRead: 0,
   cacheWrite: 0,
-  totalTokens: 2,
+  totalTokens: 18,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
 
-function user(text: string): AnyRecord {
-  return { role: 'user', content: [{ type: 'text', text }], timestamp: 1 };
+function user(text: string, timestamp = 1): AgentMessage {
+  return { role: 'user', content: text, timestamp } as AgentMessage;
 }
 
-function assistant(content: AnyRecord[]): AnyRecord {
+function assistant(content: AnyRecord[], extras: AnyRecord = {}): AgentMessage {
   return {
     role: 'assistant',
     content,
     api: 'openai-responses',
     provider: 'openai',
-    model: 'gpt-test',
+    model: 'gpt-6-astra',
+    responseId: 'response-fixture',
     usage,
-    stopReason: 'toolUse',
+    stopReason: 'stop',
     timestamp: 2,
-  };
+    ...extras,
+  } as AgentMessage;
 }
 
-function toolResult(toolCallId: string, text: string): AnyRecord {
+function toolResult(id: string, text: string, extras: AnyRecord = {}): AgentMessage {
   return {
     role: 'toolResult',
-    toolCallId,
+    toolCallId: id,
     toolName: 'read',
     content: [{ type: 'text', text }],
-    details: { source: 'fixture' },
+    details: { source: 'runtime-fixture' },
     usage,
     isError: false,
     timestamp: 3,
-  };
+    ...extras,
+  } as AgentMessage;
 }
 
-function transcript(): AnyRecord[] {
-  return [
-    user('Keep src/generated unchanged and diagnose the failing test.'),
+function appendTranscript(session: SessionManager, includeOverflowError = false): {
+  messages: AgentMessage[];
+  retainedText: string;
+  droppedOutput: string;
+  rootId: string;
+} {
+  const retainedText = `RETAINED-TEXT:${'same retained user text '.repeat(130)}`;
+  const droppedOutput = `OLD-TOOL-OUTPUT:${'this can be recomputed '.repeat(700)}`;
+  const messages: AgentMessage[] = [
+    user('Keep src/generated unchanged.'),
     assistant([
-      { type: 'text', text: 'Checking the test output.' },
-      { type: 'toolCall', id: 'read-old', name: 'read', arguments: { path: 'src/old.test.ts' } },
-    ]),
-    toolResult('read-old', 'export const oldResult = true;\n'.repeat(120)),
-    assistant([{ type: 'text', text: 'The old output is now understood.' }]),
-    user('Continue with the smallest safe change.'),
+      {
+        type: 'thinking',
+        thinking: 'Astra reasoning block must remain a typed assistant content block.',
+        thinkingSignature: 'provider-signed-thinking',
+      },
+      { type: 'text', text: 'I will preserve the provider metadata as well.' },
+    ], { responseId: 'astra-response-1' }),
+    user(retainedText, 3),
+    assistant([
+      { type: 'text', text: 'Reading an old generated report.' },
+      { type: 'toolCall', id: 'old-read', name: 'read', arguments: { path: 'reports/old.txt' } },
+    ], { stopReason: 'toolUse', timestamp: 4 }),
+    toolResult('old-read', droppedOutput, { timestamp: 5 }),
+    assistant([{ type: 'text', text: 'I have enough information to continue.' }], { timestamp: 6 }),
+    user('Continue with the targeted fix.', 7),
   ];
-}
-
-function textOf(message: AnyRecord): string {
-  if (!Array.isArray(message.content)) return typeof message.content === 'string' ? message.content : '';
-  return message.content.filter((part: AnyRecord) => part.type === 'text').map((part: AnyRecord) => part.text).join('');
+  if (includeOverflowError) {
+    messages.push(assistant(
+      [{ type: 'text', text: 'OVERFLOW-ERROR-TRAILING-PAYLOAD' }],
+      { stopReason: 'error', errorMessage: 'OVERFLOW-ERROR-TRAILING-PAYLOAD', timestamp: 8 },
+    ));
+  }
+  const ids = messages.map(message => session.appendMessage(message as any));
+  return { messages, retainedText, droppedOutput, rootId: ids[0]! };
 }
 
 function makeHarness(overrides: Record<string, string | boolean | undefined> = {}): Harness {
+  const session = SessionManager.inMemory(process.cwd());
   const handlers = new Map<string, Handler>();
   const flags = new Map<string, AnyRecord>();
   const commands = new Map<string, Command>();
   const values = new Map<string, string | boolean | undefined>(Object.entries(overrides));
   const appended: AnyRecord[] = [];
-  let branch: AnyRecord[] = [];
-  let leafId: string | null = null;
-  let sequence = 0;
-
   const ui = {
     notify: vi.fn(),
     setStatus: vi.fn(),
     log: vi.fn(),
-    setFooter: vi.fn(),
   };
-
   const ctx: AnyRecord = {
     hasUI: true,
     mode: 'tui',
+    cwd: process.cwd(),
+    sessionManager: session,
+    model: { contextWindow: 200_000 },
+    scopedModels: [],
     signal: undefined,
     ui,
-    sessionManager: {
-      getBranch: vi.fn(() => branch),
-      getSessionId: vi.fn(() => 'session-a'),
-      getLeafId: vi.fn(() => leafId),
-    },
+    isIdle: vi.fn(() => true),
+    isProjectTrusted: vi.fn(() => true),
+    hasPendingMessages: vi.fn(() => false),
+    abort: vi.fn(),
+    shutdown: vi.fn(),
+    getSystemPrompt: vi.fn(() => ''),
+    getContextUsage: vi.fn(() => ({ tokens: 60_000, contextWindow: 100_000, percent: 0 })),
+    compact: vi.fn(),
+    waitForIdle: vi.fn(async () => undefined),
   };
-
   const pi: AnyRecord = {
     on: vi.fn((event: string, handler: Handler) => handlers.set(event, handler)),
     registerFlag: vi.fn((name: string, options: AnyRecord) => flags.set(name, options)),
     getFlag: vi.fn((name: string) => values.has(name) ? values.get(name) : flags.get(name)?.default),
     registerCommand: vi.fn((name: string, command: Command) => commands.set(name, command)),
     appendEntry: vi.fn((customType: string, data: unknown) => {
-      const entry = {
-        type: 'custom',
-        id: `extension-entry-${++sequence}`,
-        parentId: leafId,
-        timestamp: sequence,
-        customType,
-        data,
-      };
-      branch = [...branch, entry];
-      leafId = entry.id;
-      appended.push(entry);
+      const id = session.appendCustomEntry(customType, data);
+      appended.push({ id, customType, data });
     }),
   };
-
   return {
+    session,
     pi,
     ctx,
     handlers,
@@ -133,12 +149,6 @@ function makeHarness(overrides: Record<string, string | boolean | undefined> = {
     setFlag(name, value) {
       values.set(name, value);
     },
-    setBranch(entries, nextLeaf = entries.at(-1)?.id ?? null) {
-      branch = [...entries];
-      leafId = nextLeaf;
-    },
-    branch: () => [...branch],
-    leaf: () => leafId,
   };
 }
 
@@ -153,9 +163,44 @@ async function fire(harness: Harness, name: string, event: AnyRecord): Promise<u
   return handler(event, harness.ctx);
 }
 
-async function runContext(harness: Harness, messages: AnyRecord[]): Promise<AnyRecord[]> {
-  const result = await fire(harness, 'context', { type: 'context', messages });
-  return (result as { messages?: AnyRecord[] } | undefined)?.messages ?? messages;
+async function start(harness: Harness, reason = 'startup'): Promise<void> {
+  await fire(harness, 'session_start', { type: 'session_start', reason });
+}
+
+function preparation(session: SessionManager): AnyRecord {
+  return {
+    firstKeptEntryId: session.getBranch()[0]?.id ?? 'first-entry',
+    messagesToSummarize: [],
+    turnPrefixMessages: [],
+    isSplitTurn: false,
+    tokensBefore: 12_345,
+    fileOps: {
+      read: new Set(['reports/old.txt']),
+      written: new Set<string>(),
+      edited: new Set(['src/fix.ts']),
+    },
+    settings: { enabled: true, reserveTokens: 20_000, keepRecentTokens: 20_000 },
+  };
+}
+
+async function beforeCompact(
+  harness: Harness,
+  options: {
+    reason?: 'manual' | 'threshold' | 'overflow';
+    willRetry?: boolean;
+    signal?: AbortSignal;
+    customInstructions?: string;
+  } = {},
+): Promise<unknown> {
+  return fire(harness, 'session_before_compact', {
+    type: 'session_before_compact',
+    preparation: preparation(harness.session),
+    branchEntries: harness.session.getBranch(),
+    reason: options.reason ?? 'manual',
+    willRetry: options.willRetry ?? false,
+    signal: options.signal ?? new AbortController().signal,
+    customInstructions: options.customInstructions,
+  });
 }
 
 async function command(harness: Harness, args: string): Promise<void> {
@@ -164,20 +209,26 @@ async function command(harness: Harness, args: string): Promise<void> {
   await registered.handler(args, harness.ctx);
 }
 
-function responseForQuestions(init: RequestInit | undefined, score: (id: string) => number): Response {
-  const body = JSON.parse(String(init?.body ?? '{}')) as { questions: Record<string, unknown> };
-  return new Response(JSON.stringify({
-    answers: Object.fromEntries(Object.keys(body.questions).map(id => [id, { type: 'noul', noul: score(id) }])),
-  }), { status: 200 });
+function scoringFetch(score: (question: string) => number, bodies: AnyRecord[] = []) {
+  return vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body ?? '{}')) as AnyRecord;
+    bodies.push(body);
+    return new Response(JSON.stringify({
+      answers: Object.fromEntries(Object.keys(body.questions ?? {}).map(question => [
+        question,
+        { type: 'noul', noul: score(question) },
+      ])),
+    }), { status: 200 });
+  });
 }
 
-function scoringFetch(score: (id: string) => number) {
-  return vi.fn(async (_url: string | URL | Request, init?: RequestInit) => responseForQuestions(init, score));
+function contextMessages(session: SessionManager): AgentMessage[] {
+  return session.buildContextEntries().flatMap(sessionEntryToContextMessages) as AgentMessage[];
 }
 
-describe('Pi extension runtime', () => {
+describe('Pi native compaction extension', () => {
   beforeEach(() => {
-    vi.stubEnv('TYPESAFE_API_KEY', 'test-key');
+    vi.stubEnv('TYPESAFE_API_KEY', 'test-key-only');
   });
 
   afterEach(() => {
@@ -187,199 +238,262 @@ describe('Pi extension runtime', () => {
     vi.restoreAllMocks();
   });
 
-  it('registers the documented flags and a single /jev command', async () => {
+  it('registers native compaction defaults and never installs the obsolete turn_end trigger', async () => {
     const harness = makeHarness();
     await register(harness);
 
     expect(Object.fromEntries(harness.flags)).toEqual({
-      'jev-min-tokens': expect.objectContaining({ type: 'string', default: '20000' }),
-      'jev-preserve-recent': expect.objectContaining({ type: 'string', default: '6' }),
-      'jev-timeout-ms': expect.objectContaining({ type: 'string', default: '10000' }),
+      'jev-compact-at-percent': expect.objectContaining({ type: 'string', default: '60' }),
+      'jev-min-reduction-ratio': expect.objectContaining({ type: 'string', default: '0.25' }),
       'jev-keep-threshold': expect.objectContaining({ type: 'string', default: '0.5' }),
+      'jev-preserve-recent': expect.objectContaining({ type: 'string', default: '6' }),
+      'jev-max-state-tokens': expect.objectContaining({ type: 'string', default: '25000' }),
+      'jev-max-request-tokens': expect.objectContaining({ type: 'string', default: '30000' }),
+      'jev-truncate-head-chars': expect.objectContaining({ type: 'string', default: '300' }),
+      'jev-timeout-ms': expect.objectContaining({ type: 'string', default: '0' }),
+      'jev-model': expect.objectContaining({ type: 'string', default: 'jev-latest' }),
       'jev-disabled': expect.objectContaining({ type: 'boolean', default: false }),
     });
     expect([...harness.commands.keys()]).toEqual(['jev']);
-    expect(harness.commands.get('jev')?.description).toMatch(/status, prune, on, off, reset, restore/);
-    await command(harness, 'status');
-    await command(harness, 'status');
-    expect(harness.ctx.ui.notify).toHaveBeenCalledTimes(2);
+    expect(harness.commands.get('jev')?.description).toMatch(/status, decisions, compact, on, off/);
+    expect(harness.handlers.has('session_before_compact')).toBe(true);
+    expect(harness.handlers.has('agent_settled')).toBe(true);
+    expect(harness.handlers.has('turn_end')).toBe(false);
   });
 
-  it('scores once, preserves Pi metadata, caches the edit, then rescans for a new user intent', async () => {
-    const fetcher = scoringFetch(id => id.startsWith('result_') ? 0.1 : 0.9);
+  it('replaces native summarization with a typed checkpoint behind a real session boundary', async () => {
+    const bodies: AnyRecord[] = [];
+    const fetcher = scoringFetch(() => 0.1, bodies);
     vi.stubGlobal('fetch', fetcher);
-    const harness = makeHarness({ 'jev-min-tokens': '0', 'jev-preserve-recent': '0' });
+    const harness = makeHarness({ 'jev-preserve-recent': '0' });
     await register(harness);
-    await fire(harness, 'session_start', { type: 'session_start', reason: 'startup' });
+    await start(harness);
+    const fixture = appendTranscript(harness.session);
 
-    const original = transcript();
-    const first = await runContext(harness, original);
-    const firstResult = first.find(message => message.role === 'toolResult');
+    const result = await beforeCompact(harness) as AnyRecord;
 
     expect(fetcher).toHaveBeenCalledTimes(1);
-    expect(first[1]).toMatchObject({ provider: 'openai', model: 'gpt-test', usage });
-    expect(first[1]?.content[0]).toEqual(original[1]?.content[0]);
-    expect(firstResult).toMatchObject({
-      toolCallId: 'read-old',
-      toolName: 'read',
-      details: { source: 'fixture' },
-      usage,
+    expect(result?.compaction).toEqual(expect.objectContaining({
+      tokensBefore: 12_345,
+      summary: expect.stringContaining('[fast-jev-compaction checkpoint '),
+    }));
+    const boundary = harness.session.getLeafEntry() as AnyRecord;
+    expect(boundary).toMatchObject({
+      type: 'custom',
+      customType: 'fast-jev-pi-boundary',
+      data: expect.objectContaining({ checkpointId: expect.any(String) }),
     });
-    expect(textOf(firstResult!)).toContain('fast-jev-compaction truncated');
-    expect(harness.appended.at(-1)).toMatchObject({
-      customType: 'fast-jev-pi',
-      data: expect.objectContaining({ version: 1, enabled: true, edits: expect.any(Array) }),
+    expect(result.compaction.firstKeptEntryId).toBe(boundary.id);
+
+    const details = result.compaction.details as AnyRecord;
+    expect(details).toMatchObject({
+      format: 'fast-jev-pi-context-v1',
+      id: boundary.data.checkpointId,
+      readFiles: ['reports/old.txt'],
+      modifiedFiles: ['src/fix.ts'],
+      stats: expect.objectContaining({ callsDropped: 1 }),
     });
+    expect(details.messages).toContainEqual(expect.objectContaining({
+      role: 'assistant',
+      provider: 'openai',
+      model: 'gpt-6-astra',
+      responseId: 'astra-response-1',
+      content: expect.arrayContaining([expect.objectContaining({ type: 'thinking', thinkingSignature: 'provider-signed-thinking' })]),
+    }));
+    expect(details.messages.some((message: AnyRecord) => message.role === 'toolResult' && message.toolCallId === 'old-read')).toBe(false);
+    expect(result.compaction.summary).toContain(fixture.retainedText);
 
-    const cached = await runContext(harness, original);
-    expect(fetcher).toHaveBeenCalledTimes(1);
-    expect(textOf(cached.find(message => message.role === 'toolResult')!)).toContain('fast-jev-compaction truncated');
-
-    const newIntent = [...original, user('Switch to investigating the release script instead.')];
-    await runContext(harness, newIntent);
-    expect(fetcher).toHaveBeenCalledTimes(2);
-  });
-
-  it('queues manual pruning, and reset or restore removes cached edits without a network side effect', async () => {
-    const fetcher = scoringFetch(id => id.startsWith('result_') ? 0.1 : 0.9);
-    vi.stubGlobal('fetch', fetcher);
-    const harness = makeHarness({ 'jev-min-tokens': '999999', 'jev-preserve-recent': '0' });
-    await register(harness);
-    await fire(harness, 'session_start', { type: 'session_start', reason: 'startup' });
-    const original = transcript();
-
-    await command(harness, 'status');
-    expect(harness.ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining('API key configured'), 'info');
-    await command(harness, 'prune');
-    expect(fetcher).not.toHaveBeenCalled();
-    await runContext(harness, original);
-    expect(fetcher).toHaveBeenCalledTimes(1);
-
-    await command(harness, 'restore');
-    const restored = await runContext(harness, original);
-    expect(fetcher).toHaveBeenCalledTimes(1);
-    expect(restored).toBe(original);
-
-    await command(harness, 'prune');
-    await runContext(harness, original);
-    expect(fetcher).toHaveBeenCalledTimes(2);
-
-    await command(harness, 'off');
-    await runContext(harness, original);
-    expect(fetcher).toHaveBeenCalledTimes(2);
-    await command(harness, 'on');
-    await command(harness, 'reset');
-    await command(harness, 'prune');
-    await runContext(harness, original);
-    expect(fetcher).toHaveBeenCalledTimes(3);
-
+    const savedCompactionId = harness.session.appendCompaction(
+      result.compaction.summary,
+      result.compaction.firstKeptEntryId,
+      result.compaction.tokensBefore,
+      details,
+      true,
+    );
+    const savedCompaction = harness.session.getEntry(savedCompactionId) as AnyRecord;
     await fire(harness, 'session_compact', {
       type: 'session_compact',
-      compactionEntry: { type: 'compaction' },
+      compactionEntry: savedCompaction,
+      fromExtension: true,
+      reason: 'manual',
+      willRetry: false,
+    });
+    await command(harness, 'decisions');
+    expect(harness.ctx.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining('drop_call'), 'info');
+    await fire(harness, 'session_compact', {
+      type: 'session_compact',
+      compactionEntry: { type: 'compaction', details: undefined },
       fromExtension: false,
       reason: 'manual',
       willRetry: false,
     });
-    expect(harness.appended.at(-1)).toMatchObject({
-      customType: 'fast-jev-pi',
-      data: expect.objectContaining({ edits: [] }),
-    });
-  });
+    await command(harness, 'decisions');
+    expect(harness.ctx.ui.notify).toHaveBeenLastCalledWith('Jev: no decisions yet', 'info');
+    const nativeContext = contextMessages(harness.session);
+    expect(nativeContext).toHaveLength(1);
+    expect(nativeContext[0]).toMatchObject({ role: 'compactionSummary', summary: result.compaction.summary });
 
-  it('hydrates only the active branch after resume and tree navigation', async () => {
-    const fetcher = scoringFetch(id => id.startsWith('result_') ? 0.1 : 0.9);
-    vi.stubGlobal('fetch', fetcher);
-    const flags = { 'jev-min-tokens': '0', 'jev-preserve-recent': '0' };
-    const firstRuntime = makeHarness(flags);
-    await register(firstRuntime);
-    await fire(firstRuntime, 'session_start', { type: 'session_start', reason: 'startup' });
-    const original = transcript();
-    await runContext(firstRuntime, original);
-    const mainBranch = firstRuntime.branch();
-    const mainLeaf = firstRuntime.leaf();
+    const restored = await fire(harness, 'context', { type: 'context', messages: nativeContext }) as AnyRecord;
+    expect(restored.messages).toEqual(details.messages);
     expect(fetcher).toHaveBeenCalledTimes(1);
 
-    const resumed = makeHarness(flags);
-    resumed.setBranch(mainBranch, mainLeaf);
-    await register(resumed);
-    await fire(resumed, 'session_start', { type: 'session_start', reason: 'resume' });
-    await runContext(resumed, original);
+    await command(harness, 'off');
+    const withNewUser = [...nativeContext, user('Now inspect the deployment script.', 99)];
+    const afterOff = await fire(harness, 'context', { type: 'context', messages: withNewUser }) as AnyRecord;
+    expect(afterOff.messages).toEqual([...details.messages, withNewUser.at(-1)]);
+    expect(afterOff.messages.some((message: AnyRecord) => message.role === 'toolResult' && message.toolCallId === 'old-read')).toBe(false);
+    expect(JSON.stringify(afterOff.messages)).not.toContain(fixture.droppedOutput);
     expect(fetcher).toHaveBeenCalledTimes(1);
-
-    resumed.setBranch([], null);
-    await fire(resumed, 'session_tree', { type: 'session_tree', newLeafId: null, oldLeafId: mainLeaf });
-    await runContext(resumed, original);
-    expect(fetcher).toHaveBeenCalledTimes(2);
-
-    resumed.setBranch(mainBranch, mainLeaf);
-    await fire(resumed, 'session_tree', { type: 'session_tree', newLeafId: mainLeaf, oldLeafId: null });
-    await runContext(resumed, original);
-    expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
-  it('keeps raw context when the key is missing, configuration is invalid, or Jev fails', async () => {
-    const fetcher = vi.fn(async () => new Response('server transcript and secret key must not reach the UI', { status: 500 }));
-    vi.stubGlobal('fetch', fetcher);
-    const missingKey = makeHarness({ 'jev-min-tokens': '0' });
+  it('falls back to Pi native compaction for missing credentials, low reduction, request failure, and timeout', async () => {
     vi.stubEnv('TYPESAFE_API_KEY', '');
+    const missingKey = makeHarness({ 'jev-preserve-recent': '0' });
     await register(missingKey);
-    await fire(missingKey, 'session_start', { type: 'session_start', reason: 'startup' });
-    const original = transcript();
-    expect(await runContext(missingKey, original)).toBe(original);
-    expect(fetcher).not.toHaveBeenCalled();
+    await start(missingKey);
+    appendTranscript(missingKey.session);
+    await expect(beforeCompact(missingKey)).resolves.toBeUndefined();
+    expect(missingKey.appended).toHaveLength(0);
 
-    vi.stubEnv('TYPESAFE_API_KEY', 'test-key');
-    const disabled = makeHarness({ 'jev-min-tokens': '0', 'jev-disabled': true });
-    await register(disabled);
-    await fire(disabled, 'session_start', { type: 'session_start', reason: 'startup' });
-    expect(await runContext(disabled, original)).toBe(original);
-    expect(fetcher).not.toHaveBeenCalled();
+    vi.stubEnv('TYPESAFE_API_KEY', 'test-key-only');
+    const lowReductionFetcher = scoringFetch(() => 0.99);
+    vi.stubGlobal('fetch', lowReductionFetcher);
+    const lowReduction = makeHarness({ 'jev-preserve-recent': '0' });
+    await register(lowReduction);
+    await start(lowReduction);
+    appendTranscript(lowReduction.session);
+    await expect(beforeCompact(lowReduction)).resolves.toBeUndefined();
+    expect(lowReductionFetcher).toHaveBeenCalledTimes(1);
+    expect(lowReduction.appended).toHaveLength(0);
 
-    const invalid = makeHarness({ 'jev-min-tokens': 'not-a-number' });
-    await register(invalid);
-    await fire(invalid, 'session_start', { type: 'session_start', reason: 'startup' });
-    await runContext(invalid, original);
-    await runContext(invalid, original);
-    expect(fetcher).not.toHaveBeenCalled();
-    expect(invalid.ctx.ui.notify).toHaveBeenCalledTimes(1);
-    expect(invalid.ctx.ui.notify).toHaveBeenCalledWith('Jev: Invalid --jev-min-tokens', 'warning');
+    const failingFetcher = vi.fn(async () => new Response('private transcript must stay out of UI', { status: 500 }));
+    vi.stubGlobal('fetch', failingFetcher);
+    const failing = makeHarness({ 'jev-preserve-recent': '0' });
+    await register(failing);
+    await start(failing);
+    appendTranscript(failing.session);
+    await expect(beforeCompact(failing)).resolves.toBeUndefined();
+    expect(failing.appended).toHaveLength(0);
+    expect(JSON.stringify(failing.ctx.ui.notify.mock.calls)).not.toContain('private transcript');
 
-    const failed = makeHarness({ 'jev-min-tokens': '0', 'jev-preserve-recent': '0' });
-    await register(failed);
-    await fire(failed, 'session_start', { type: 'session_start', reason: 'startup' });
-    expect(await runContext(failed, original)).toBe(original);
-    expect(await runContext(failed, original)).toBe(original);
-    expect(fetcher).toHaveBeenCalledTimes(1);
-    expect(failed.ctx.ui.notify).toHaveBeenCalledWith('Jev: scoring failed; original context kept', 'warning');
-    expect(JSON.stringify(failed.ctx.ui.notify.mock.calls)).not.toContain('server transcript');
-    const moreToolWork = [...original, assistant([{ type: 'text', text: 'Still checking.' }])];
-    expect(await runContext(failed, moreToolWork)).toBe(moreToolWork);
-    expect(fetcher).toHaveBeenCalledTimes(1);
-    const newIntent = [...original, user('Investigate a different issue now.')];
-    expect(await runContext(failed, newIntent)).toBe(newIntent);
-    expect(fetcher).toHaveBeenCalledTimes(2);
+    vi.useFakeTimers();
+    const slowFetcher = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      text: () => new Promise<string>(() => undefined),
+    }) as Response);
+    vi.stubGlobal('fetch', slowFetcher);
+    const timeout = makeHarness({ 'jev-preserve-recent': '0', 'jev-timeout-ms': '5' });
+    await register(timeout);
+    await start(timeout);
+    appendTranscript(timeout.session);
+    const pending = beforeCompact(timeout);
+    const assertion = expect(pending).resolves.toBeUndefined();
+    await vi.advanceTimersByTimeAsync(5);
+    await assertion;
+    expect(timeout.appended).toHaveLength(0);
   });
 
-  it('cancels a stale score when navigation changes the active branch', async () => {
-    let resolveResponse: ((response: Response) => void) | undefined;
-    const fetcher = vi.fn((_url: string | URL | Request, _init?: RequestInit) => new Promise<Response>(resolve => {
-      resolveResponse = resolve;
-    }));
+  it('cancels only when Pi aborts the actual compaction signal', async () => {
+    const fetcher = vi.fn((_url: string | URL | Request, _init?: RequestInit) => new Promise<Response>(() => undefined));
     vi.stubGlobal('fetch', fetcher);
-    const harness = makeHarness({ 'jev-min-tokens': '0', 'jev-preserve-recent': '0' });
+    const harness = makeHarness({ 'jev-preserve-recent': '0' });
     await register(harness);
-    await fire(harness, 'session_start', { type: 'session_start', reason: 'startup' });
-    const original = transcript();
-
-    const pending = runContext(harness, original);
+    await start(harness);
+    appendTranscript(harness.session);
+    const controller = new AbortController();
+    const pending = beforeCompact(harness, { signal: controller.signal });
     await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(1));
-    harness.setBranch([], null);
-    await fire(harness, 'session_tree', { type: 'session_tree', newLeafId: null, oldLeafId: null });
-    resolveResponse?.(responseForQuestions(fetcher.mock.calls[0]?.[1], () => 0.9));
+    controller.abort(new Error('Pi cancelled compaction'));
 
-    expect(await pending).toBe(original);
+    await expect(pending).resolves.toEqual({ cancel: true });
     expect(harness.appended).toHaveLength(0);
+  });
 
-    await fire(harness, 'session_shutdown', { type: 'session_shutdown', reason: 'quit' });
+  it('forwards explicit /compact instructions as the Jev scoring goal', async () => {
+    const bodies: AnyRecord[] = [];
+    const fetcher = scoringFetch(() => 0.1, bodies);
+    vi.stubGlobal('fetch', fetcher);
+    const harness = makeHarness({ 'jev-preserve-recent': '0' });
+    await register(harness);
+    await start(harness);
+    appendTranscript(harness.session);
+
+    await expect(beforeCompact(harness, {
+      customInstructions: 'Focus only on the deployment rollback files.',
+    })).resolves.toEqual(expect.objectContaining({ compaction: expect.any(Object) }));
+
+    expect(bodies[0]?.state.goal).toBe('Focus only on the deployment rollback files.');
+  });
+
+  it('falls back to Pi when a retained checkpoint cannot fit the active model, including overflow recovery', async () => {
+    const fetcher = scoringFetch(() => 0.1);
+    vi.stubGlobal('fetch', fetcher);
+    const harness = makeHarness({ 'jev-preserve-recent': '0' });
+    harness.ctx.model = { contextWindow: 100 };
+    await register(harness);
+    await start(harness);
+    appendTranscript(harness.session);
+
+    await expect(beforeCompact(harness, { reason: 'overflow', willRetry: true })).resolves.toBeUndefined();
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(harness.appended).toHaveLength(0);
+    expect(harness.ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining('retained context still exceeds the model budget'),
+      'warning',
+    );
+  });
+
+  it('triggers automatic compaction once at 60 percent and resets the guard when Pi completes it', async () => {
+    const harness = makeHarness();
+    await register(harness);
+    await start(harness);
+    harness.ctx.getContextUsage.mockReturnValue({ tokens: 60_000, contextWindow: 100_000, percent: 60 });
+
+    await fire(harness, 'agent_settled', { type: 'agent_settled' });
+    await fire(harness, 'agent_settled', { type: 'agent_settled' });
+    expect(harness.ctx.compact).toHaveBeenCalledTimes(1);
+    const firstOptions = harness.ctx.compact.mock.calls[0]?.[0] as AnyRecord;
+    expect(firstOptions).toEqual(expect.objectContaining({ onComplete: expect.any(Function), onError: expect.any(Function) }));
+
+    firstOptions.onComplete();
+    await fire(harness, 'agent_settled', { type: 'agent_settled' });
+    expect(harness.ctx.compact).toHaveBeenCalledTimes(2);
+  });
+
+  it('uses /jev compact and the prune alias to call Pi compaction directly without a background score', async () => {
+    const fetcher = vi.fn();
+    vi.stubGlobal('fetch', fetcher);
+    const harness = makeHarness();
+    await register(harness);
+    await start(harness);
+
+    await command(harness, 'compact');
+    expect(harness.ctx.waitForIdle).toHaveBeenCalledTimes(1);
+    expect(harness.ctx.compact).toHaveBeenCalledTimes(1);
+    expect(fetcher).not.toHaveBeenCalled();
+    const firstOptions = harness.ctx.compact.mock.calls[0]?.[0] as AnyRecord;
+    firstOptions.onError();
+
+    await command(harness, 'prune');
+    expect(harness.ctx.waitForIdle).toHaveBeenCalledTimes(2);
+    expect(harness.ctx.compact).toHaveBeenCalledTimes(2);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it('excludes a trailing overflow error before Jev sees or checkpoints it', async () => {
+    const bodies: AnyRecord[] = [];
+    const fetcher = scoringFetch(() => 0.1, bodies);
+    vi.stubGlobal('fetch', fetcher);
+    const harness = makeHarness({ 'jev-preserve-recent': '0' });
+    await register(harness);
+    await start(harness);
+    appendTranscript(harness.session, true);
+
+    const result = await beforeCompact(harness, { reason: 'overflow', willRetry: true }) as AnyRecord;
+
+    expect(result?.compaction).toBeDefined();
+    expect(JSON.stringify(bodies[0]?.state)).not.toContain('OVERFLOW-ERROR-TRAILING-PAYLOAD');
+    expect(JSON.stringify(result.compaction.details.messages)).not.toContain('OVERFLOW-ERROR-TRAILING-PAYLOAD');
   });
 });

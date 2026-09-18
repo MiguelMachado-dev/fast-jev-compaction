@@ -86,6 +86,23 @@ describe('Pi Jev transport', () => {
     transport.dispose();
   });
 
+  it('allows the native no-deadline default and a configured Jev model', async () => {
+    vi.useFakeTimers();
+    let resolveResponse!: (response: Response) => void;
+    const fetcher = vi.fn((_url: string | URL | Request, _init?: RequestInit) =>
+      new Promise<Response>(resolve => { resolveResponse = resolve; }));
+    const transport = createJevTransport('test-key', 0, undefined, fetcher as typeof fetch, 'jev-custom');
+    const pending = transport.asker.ask('state', questions);
+
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(transport.signal.aborted).toBe(false);
+    const init = fetcher.mock.calls[0]![1];
+    expect(JSON.parse(String(init?.body)).model).toBe('jev-custom');
+    resolveResponse(answerResponse(init));
+    await expect(pending).resolves.toHaveProperty('answers.old_call.noul', 0.4);
+    transport.dispose();
+  });
+
   it('propagates parent and explicit cancellation to in-flight requests', async () => {
     const parent = new AbortController();
     const fetcher = vi.fn((_url: string | URL | Request, _init?: RequestInit) => new Promise<Response>(() => undefined));

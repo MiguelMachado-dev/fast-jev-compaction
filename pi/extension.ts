@@ -1,118 +1,71 @@
-import { createHash } from 'node:crypto';
-import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
-import { estimateTokens } from '../src/state.js';
-import { applyPiEdits, compactPiMessages, type PiEdit } from './adapter.js';
+import { estimateTokens, sessionEntryToContextMessages } from '@earendil-works/pi-coding-agent';
+import { DEFAULT_OPTIONS, reductionRatio } from '../src/compact.js';
+import { DEFAULT_MODEL } from '../src/request.js';
+import type { CompactOptions, CompactResult } from '../src/types.js';
+import { compactPiMessages } from './adapter.js';
+import { createCheckpoint, isJevCheckpoint, renderCheckpoint, restoreCheckpoints } from './checkpoint.js';
 import { createJevTransport } from './transport.js';
 
-const STATE_TYPE = 'fast-jev-pi';
-const RESCORE_MESSAGES = 8;
-const RETRY_DELAY_MS = 30_000;
+const SETTINGS_ENTRY = 'fast-jev-pi-settings';
+const BOUNDARY_ENTRY = 'fast-jev-pi-boundary';
 
-interface Config {
-  minTokens: number;
-  preserveRecentMessages: number;
+export interface PiConfig extends CompactOptions {
+  compactAtPercent: number;
+  minReductionRatio: number;
+  model: string;
   timeoutMs: number;
-  keepThreshold: number;
 }
 
-interface Snapshot {
-  version: 1;
-  enabled: boolean;
-  configHash: string;
-  edits: PiEdit[];
-  messageCount: number;
-  inputHash: string;
-  userHash: string;
-}
-
-function hash(value: unknown): string {
-  return createHash('sha256').update(JSON.stringify(value)).digest('hex');
-}
-
-function latestUserHash(messages: readonly AgentMessage[]): string {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i]!.role === 'user') return hash([i, messages[i]]);
-  }
-  return hash(null);
-}
-
-function parseSnapshot(data: unknown): Snapshot | undefined {
-  if (!data || typeof data !== 'object') return;
-  const value = data as Partial<Snapshot>;
-  if (value.version !== 1 || typeof value.enabled !== 'boolean' ||
-      typeof value.configHash !== 'string' || typeof value.inputHash !== 'string' ||
-      typeof value.userHash !== 'string' || !Number.isSafeInteger(value.messageCount) ||
-      value.messageCount! < 0 || !Array.isArray(value.edits)) return;
-  if (!value.edits.every(edit => edit && typeof edit.toolCallId === 'string' &&
-      typeof edit.fingerprint === 'string' &&
-      (edit.action === 'drop_call' || (edit.action === 'drop_result' && typeof edit.text === 'string')))) return;
-  return value as Snapshot;
-}
-
-/** Only text and tool arguments/results count toward this deliberately approximate trigger. */
-function contextTokens(messages: readonly AgentMessage[]): number {
-  let total = 0;
-  for (const message of messages) {
-    if (message.role === 'compactionSummary' || message.role === 'branchSummary') {
-      total += estimateTokens(message.summary);
-      continue;
-    }
-    if (message.role === 'bashExecution') {
-      if (!message.excludeFromContext) total += estimateTokens(message.command + message.output);
-      continue;
-    }
-    if (!('content' in message)) continue;
-    if (typeof message.content === 'string') total += estimateTokens(message.content);
-    else if (Array.isArray(message.content)) {
-      for (const part of message.content) {
-        if (part.type === 'text') total += estimateTokens(part.text);
-        else if (part.type === 'toolCall') total += estimateTokens(JSON.stringify(part.arguments));
-        else if (part.type === 'thinking') total += estimateTokens(part.thinking);
-      }
-    }
-  }
-  return total;
+function describe(stats: CompactResult['stats']): string {
+  return `${Math.round(reductionRatio({ stats }) * 100)}% reduction; ` +
+    `${stats.callsDropped} calls dropped, ${stats.resultsDropped} results truncated, ` +
+    `${stats.pinned} pinned; ${stats.requests} Jev request(s)`;
 }
 
 export default function registerPiExtension(pi: ExtensionAPI): void {
-  pi.registerFlag('jev-min-tokens', { description: 'Approximate context tokens before Jev pruning', type: 'string', default: '20000' });
-  pi.registerFlag('jev-preserve-recent', { description: 'Newest message rows protected from Jev pruning', type: 'string', default: '6' });
-  pi.registerFlag('jev-timeout-ms', { description: 'Deadline for a complete Jev scoring pass', type: 'string', default: '10000' });
-  pi.registerFlag('jev-keep-threshold', { description: 'Minimum probability for keeping a call or result', type: 'string', default: '0.5' });
-  pi.registerFlag('jev-disabled', { description: 'Start with Jev pruning disabled', type: 'boolean', default: false });
+  const flags: Array<[string, string, number]> = [
+    ['jev-compact-at-percent', 'Context percentage that triggers compaction after a completed turn', 60],
+    ['jev-min-reduction-ratio', 'Minimum character reduction before replacing native summarization', 0.25],
+    ['jev-keep-threshold', 'Minimum probability for keeping a call or full result', DEFAULT_OPTIONS.keepThreshold],
+    ['jev-preserve-recent', 'Newest message rows preserved by the native compactor', DEFAULT_OPTIONS.preserveRecentMessages],
+    ['jev-max-state-tokens', 'Estimated Jev state token budget', DEFAULT_OPTIONS.maxStateTokens],
+    ['jev-max-request-tokens', 'Estimated Jev request token budget', DEFAULT_OPTIONS.maxRequestTokens],
+    ['jev-truncate-head-chars', 'Characters retained when a result is truncated', DEFAULT_OPTIONS.truncateHeadChars],
+    ['jev-timeout-ms', 'Optional deadline for a scoring pass; 0 disables the deadline', 0],
+  ];
+  for (const [name, description, value] of flags) {
+    pi.registerFlag(name, { description, type: 'string', default: String(value) });
+  }
+  pi.registerFlag('jev-model', { description: 'TypeSafe compaction model', type: 'string', default: DEFAULT_MODEL });
+  pi.registerFlag('jev-disabled', { description: 'Start with native Pi summarization only', type: 'boolean', default: false });
 
-  let enabled = true;
+  let config: PiConfig | undefined;
   let initialized = false;
-  let config: Config | undefined;
-  let snapshot: Snapshot | undefined;
-  let force = false;
+  let enabled = true;
   let generation = 0;
+  let requested = false;
   let active: ReturnType<typeof createJevTransport> | undefined;
-  let lastAttempt = 0;
-  let attemptedUserHash = '';
-  let lastNotice = '';
-  let status = 'waiting for context';
+  let status = 'ready';
+  let lastStats: CompactResult['stats'] | undefined;
+  let lastDecisions: CompactResult['decisions'] = [];
 
   function notify(ctx: ExtensionContext, text: string, warning = false): void {
-    if (ctx.hasUI && text !== lastNotice) ctx.ui.notify(`Jev: ${text}`, warning ? 'warning' : 'info');
-    lastNotice = text;
+    if (ctx.hasUI) ctx.ui.notify(`Jev: ${text}`, warning ? 'warning' : 'info');
   }
 
   function showStatus(ctx: ExtensionContext): void {
-    if (ctx.hasUI) ctx.ui.setStatus(STATE_TYPE, `Jev: ${enabled ? status : 'off'}`);
+    if (ctx.hasUI) ctx.ui.setStatus('fast-jev-pi', `Jev: ${enabled ? status : 'off'}`);
   }
 
   function invalidate(): void {
     generation++;
     active?.abort();
     active = undefined;
-    force = false;
-    attemptedUserHash = '';
-    lastAttempt = 0;
+    requested = false;
   }
 
-  function readConfig(): Config {
+  function readConfig(): PiConfig {
     function number(name: string, fallback: number, min: number, max: number, integer = true): number {
       const raw = pi.getFlag(name) ?? String(fallback);
       const value = typeof raw === 'string' && raw.trim() ? Number(raw) : NaN;
@@ -121,42 +74,39 @@ export default function registerPiExtension(pi: ExtensionAPI): void {
       }
       return value;
     }
+    const model = pi.getFlag('jev-model') ?? DEFAULT_MODEL;
+    if (typeof model !== 'string' || !model.trim()) throw new Error('Invalid --jev-model');
     return {
-      minTokens: number('jev-min-tokens', 20_000, 0, Number.MAX_SAFE_INTEGER),
-      preserveRecentMessages: number('jev-preserve-recent', 6, 0, Number.MAX_SAFE_INTEGER),
-      timeoutMs: number('jev-timeout-ms', 10_000, 1, 120_000),
-      keepThreshold: number('jev-keep-threshold', 0.5, 0, 1, false),
+      compactAtPercent: number('jev-compact-at-percent', 60, 0, 100, false),
+      minReductionRatio: number('jev-min-reduction-ratio', 0.25, 0, 1, false),
+      keepThreshold: number('jev-keep-threshold', DEFAULT_OPTIONS.keepThreshold, 0, 1, false),
+      preserveRecentMessages: number('jev-preserve-recent', DEFAULT_OPTIONS.preserveRecentMessages, 0, Number.MAX_SAFE_INTEGER),
+      maxStateTokens: number('jev-max-state-tokens', DEFAULT_OPTIONS.maxStateTokens, 1, Number.MAX_SAFE_INTEGER),
+      maxRequestTokens: number('jev-max-request-tokens', DEFAULT_OPTIONS.maxRequestTokens, 1, Number.MAX_SAFE_INTEGER),
+      truncateHeadChars: number('jev-truncate-head-chars', DEFAULT_OPTIONS.truncateHeadChars, 0, Number.MAX_SAFE_INTEGER),
+      timeoutMs: number('jev-timeout-ms', 0, 0, 2_147_483_647),
+      model: model.trim(),
     };
   }
 
-  function persist(): void {
-    if (!config) return;
-    const data: Snapshot = snapshot
-      ? { ...snapshot, enabled }
-      : { version: 1, enabled, configHash: hash(config), edits: [], messageCount: 0, inputHash: '', userHash: '' };
-    pi.appendEntry(STATE_TYPE, data);
-  }
-
   function hydrate(ctx: ExtensionContext): void {
-    initialized = true;
     invalidate();
-    snapshot = undefined;
-    lastNotice = '';
+    initialized = true;
+    lastStats = undefined;
+    lastDecisions = [];
     try {
       config = readConfig();
-      // getBranch excludes siblings; native compaction invalidates older pruning snapshots.
       const branch = ctx.sessionManager.getBranch();
-      for (let i = branch.length - 1; i >= 0; i--) {
-        const entry = branch[i]!;
-        if (entry.type === 'compaction') break;
-        if (entry.type === 'custom' && entry.customType === STATE_TYPE) {
-          snapshot = parseSnapshot(entry.data);
-          break;
-        }
+      const saved = [...branch].reverse().find(entry => entry.type === 'custom' && entry.customType === SETTINGS_ENTRY);
+      enabled = pi.getFlag('jev-disabled') !== true &&
+        !(saved?.type === 'custom' && saved.data && typeof saved.data === 'object' &&
+          'enabled' in saved.data && saved.data.enabled === false);
+      const lastCompaction = [...branch].reverse().find(entry => entry.type === 'compaction');
+      if (lastCompaction?.type === 'compaction' && isJevCheckpoint(lastCompaction.details)) {
+        lastStats = lastCompaction.details.stats;
+        lastDecisions = lastCompaction.details.decisions ?? [];
       }
-      enabled = pi.getFlag('jev-disabled') !== true && (snapshot?.enabled ?? true);
-      if (snapshot?.configHash !== hash(config)) snapshot = undefined;
-      status = process.env.TYPESAFE_API_KEY ? 'ready' : 'no API key';
+      status = lastStats ? describe(lastStats) : 'ready';
     } catch (error) {
       config = undefined;
       enabled = false;
@@ -168,113 +118,149 @@ export default function registerPiExtension(pi: ExtensionAPI): void {
 
   pi.on('session_start', (_event, ctx) => hydrate(ctx));
   pi.on('session_tree', (_event, ctx) => hydrate(ctx));
-  pi.on('session_shutdown', () => { invalidate(); snapshot = undefined; });
-  pi.on('session_compact', (_event, ctx) => {
-    invalidate();
-    snapshot = undefined;
-    status = 'ready after Pi compaction';
-    persist();
+  pi.on('session_shutdown', () => invalidate());
+
+  // Decode already-committed compactions even while future Jev compaction is off.
+  // This hook never scores or revisits prior keep/drop decisions.
+  pi.on('context', (event, ctx) => ({
+    messages: restoreCheckpoints(event.messages, ctx.sessionManager.getBranch()),
+  }));
+
+  pi.on('session_before_compact', async (event, ctx) => {
+    if (!initialized) hydrate(ctx);
+    if (!enabled || !config) return;
+    const fallback = (reason: string) => {
+      status = `fallback to Pi summary (${reason})`;
+      notify(ctx, status, true);
+      showStatus(ctx);
+    };
+    const apiKey = process.env.TYPESAFE_API_KEY?.trim();
+    if (!apiKey) { fallback('TYPESAFE_API_KEY missing'); return; }
+    const epoch = generation;
+    const settings = config;
+    const sessionId = ctx.sessionManager.getSessionId();
+    const leafId = ctx.sessionManager.getLeafId();
+    const transport = createJevTransport(apiKey, settings.timeoutMs, event.signal, fetch, settings.model);
+    active = transport;
+    try {
+      status = 'compacting';
+      showStatus(ctx);
+      const branch = ctx.sessionManager.getBranch();
+      let messages = restoreCheckpoints(
+        ctx.sessionManager.buildContextEntries().flatMap(sessionEntryToContextMessages), branch,
+      );
+      // Pi removes this failed response from live state before overflow recovery.
+      // Do not bury it inside a checkpoint where Pi's retry cleanup cannot see it.
+      const last = messages[messages.length - 1];
+      if (event.willRetry && last?.role === 'assistant' &&
+          (last.stopReason === 'error' || last.stopReason === 'length')) messages = messages.slice(0, -1);
+      const result = await compactPiMessages(messages, transport.asker, {
+        ...settings,
+        goal: event.customInstructions?.trim() || settings.goal,
+      });
+      if (event.signal.aborted) return { cancel: true };
+      if (epoch !== generation || ctx.sessionManager.getSessionId() !== sessionId || ctx.sessionManager.getLeafId() !== leafId) {
+        fallback('session context changed during scoring');
+        return;
+      }
+      if (reductionRatio(result) < settings.minReductionRatio) {
+        fallback(`below ${Math.round(settings.minReductionRatio * 100)}% minimum: ${describe(result.stats)}`);
+        return;
+      }
+      const previousCompaction = [...branch].reverse().find(entry => entry.type === 'compaction');
+      const previousFiles = previousCompaction?.type === 'compaction' && isJevCheckpoint(previousCompaction.details)
+        ? previousCompaction.details : undefined;
+      const details = createCheckpoint(result.messages, result.stats, event.preparation.fileOps, messages, previousFiles);
+      details.decisions = result.decisions;
+      const summary = renderCheckpoint(details);
+      const safeBudget = ctx.model ? ctx.model.contextWindow - event.preparation.settings.reserveTokens : undefined;
+      const retainedTokens = result.messages.reduce((sum, message) => sum + estimateTokens(message), 0);
+      const checkpointTokens = estimateTokens({ role: 'compactionSummary', summary, tokensBefore: event.preparation.tokensBefore, timestamp: Date.now() });
+      if (safeBudget !== undefined && Math.max(retainedTokens, checkpointTokens) >= safeBudget) {
+        // A smaller checkpoint can still exceed a model's limit. Let Pi recover
+        // normally rather than committing a checkpoint it cannot compact again.
+        fallback('retained context still exceeds the model budget');
+        return;
+      }
+      // A custom entry is a real, non-message cutoff. The typed checkpoint holds
+      // the complete retained context; there is no duplicated original tail.
+      pi.appendEntry(BOUNDARY_ENTRY, { checkpointId: details.id });
+      const firstKeptEntryId = ctx.sessionManager.getLeafId();
+      if (!firstKeptEntryId) throw new Error('Missing checkpoint boundary');
+      return {
+        compaction: { summary, firstKeptEntryId, tokensBefore: event.preparation.tokensBefore, details },
+      };
+    } catch {
+      if (event.signal.aborted) return { cancel: true };
+      fallback('Jev request or transcript validation failed');
+      return;
+    } finally {
+      transport.dispose();
+      if (active === transport) active = undefined;
+    }
+  });
+
+  pi.on('session_compact', (event, ctx) => {
+    if (isJevCheckpoint(event.compactionEntry.details)) {
+      lastStats = event.compactionEntry.details.stats;
+      lastDecisions = event.compactionEntry.details.decisions ?? [];
+      status = `kept original messages, no summary; ${describe(lastStats)}`;
+      notify(ctx, status);
+    } else {
+      lastStats = undefined;
+      lastDecisions = [];
+      status = 'Pi summary applied';
+    }
+    showStatus(ctx);
+  });
+  pi.on('session_compact_failed', (_event, ctx) => {
+    lastStats = undefined;
+    lastDecisions = [];
+    status = 'compaction failed or cancelled; previous context retained';
     showStatus(ctx);
   });
 
-  pi.registerCommand('jev', {
-    description: 'Jev context pruning: status, prune, on, off, reset, restore',
-    handler: async (args, ctx) => {
-      // Explicit commands should always answer, even if automatic warnings are deduplicated.
-      lastNotice = '';
-      const command = args.trim() || 'status';
-      if (!initialized) hydrate(ctx);
-      if (command === 'status') {
-        const key = process.env.TYPESAFE_API_KEY ? 'configured' : 'missing';
-        notify(ctx, `${enabled ? status : 'off'}; API key ${key}; ${snapshot?.edits.length ?? 0} cached edits`);
-        return;
-      }
-      if (!['prune', 'on', 'off', 'reset', 'restore'].includes(command)) {
-        notify(ctx, 'usage: /jev status|prune|on|off|reset|restore');
-        return;
-      }
-      invalidate();
-      if (command === 'off') enabled = false;
-      if (command === 'on') enabled = true;
-      if (command === 'reset' || command === 'restore') snapshot = undefined;
-      if (command === 'prune') {
-        if (!enabled || !config || !process.env.TYPESAFE_API_KEY) {
-          notify(ctx, 'pruning requires valid flags, /jev on, and TYPESAFE_API_KEY', true);
-          return;
-        }
-        force = true;
-        status = 'pruning queued for next request';
-      } else status = command === 'off' ? 'off' : 'ready';
-      persist();
-      showStatus(ctx);
-      notify(ctx, command === 'reset' || command === 'restore'
-        ? 'cached edits cleared; automatic pruning remains enabled if it was on'
-        : status);
-    },
+  function requestCompaction(ctx: ExtensionContext): void {
+    if (requested || active) return;
+    requested = true;
+    const epoch = generation;
+    ctx.compact({
+      onComplete: () => { if (epoch === generation) requested = false; },
+      onError: () => { if (epoch === generation) requested = false; },
+    });
+  }
+
+  // ctx.compact() aborts active Pi runs, so trigger only after the complete turn
+  // has settled. Pi's own threshold/overflow compaction uses the same hook above.
+  pi.on('agent_settled', (_event, ctx) => {
+    if (!initialized) hydrate(ctx);
+    if (!enabled || !config || !ctx.isIdle()) return;
+    if ((ctx.getContextUsage()?.percent ?? 0) >= config.compactAtPercent) requestCompaction(ctx);
   });
 
-  pi.on('context', async (event, ctx) => {
-    if (!initialized) hydrate(ctx);
-    const apiKey = process.env.TYPESAFE_API_KEY;
-    if (!enabled || !config || !apiKey || ctx.signal?.aborted || active) return;
-    const original = event.messages;
-    const epoch = generation;
-    const session = ctx.sessionManager.getSessionId();
-    const leaf = ctx.sessionManager.getLeafId();
-    let transport: ReturnType<typeof createJevTransport> | undefined;
-    try {
-      const userHash = latestUserHash(original);
-      const samePrefix = snapshot && snapshot.messageCount <= original.length &&
-        snapshot.inputHash === hash(original.slice(0, snapshot.messageCount));
-      // New intent must not inherit omissions selected for the previous task.
-      const reusable = !!samePrefix && snapshot?.userHash === userHash;
-      const due = force || !reusable || original.length - snapshot!.messageCount >= RESCORE_MESSAGES;
-      if (!due) return { messages: applyPiEdits(original, snapshot!.edits, config.preserveRecentMessages) };
-      if (!force && contextTokens(original) < config.minTokens) {
-        return { messages: reusable ? applyPiEdits(original, snapshot!.edits, config.preserveRecentMessages) : original };
-      }
-      const inputHash = hash(original);
-      if (!force && attemptedUserHash === userHash && Date.now() - lastAttempt < RETRY_DELAY_MS) {
-        return { messages: reusable ? applyPiEdits(original, snapshot!.edits, config.preserveRecentMessages) : original };
-      }
-      force = false;
-      attemptedUserHash = userHash;
-      lastAttempt = Date.now();
-      transport = createJevTransport(apiKey, config.timeoutMs, ctx.signal);
-      active = transport;
-      status = 'scoring';
-      showStatus(ctx);
-      const result = await compactPiMessages(original, transport.asker, config);
-      if (transport.signal.aborted || epoch !== generation ||
-          session !== ctx.sessionManager.getSessionId() || leaf !== ctx.sessionManager.getLeafId()) {
-        if (epoch === generation) {
-          status = 'context changed; original context kept';
-          showStatus(ctx);
-        }
-        return { messages: original };
-      }
-      snapshot = {
-        version: 1, enabled, configHash: hash(config), edits: result.edits,
-        messageCount: original.length, inputHash, userHash,
-      };
-      // Successful scoring is debounced by message growth, not by the failure cooldown.
-      attemptedUserHash = '';
-      persist();
-      status = `${result.edits.length} edits; ~${contextTokens(original) - contextTokens(result.messages)} tokens removed`;
-      showStatus(ctx);
-      return { messages: result.messages };
-    } catch {
-      if (epoch === generation) {
-        snapshot = undefined;
-        status = 'scoring failed; original context kept';
-        // Exceptions can contain server-controlled or transcript data. Keep UI text fixed.
-        notify(ctx, status, true);
+  pi.registerCommand('jev', {
+    description: 'Jev compaction: status, decisions, compact, on, off',
+    handler: async (args, ctx) => {
+      if (!initialized) hydrate(ctx);
+      const command = args.trim() || 'status';
+      if (command === 'status') {
+        notify(ctx, `${enabled ? status : 'off'}; API key ${process.env.TYPESAFE_API_KEY?.trim() ? 'configured' : 'missing'}; ` +
+          `auto at ${config?.compactAtPercent ?? 60}%; minimum reduction ${Math.round((config?.minReductionRatio ?? 0.25) * 100)}%`);
+      } else if (command === 'decisions') {
+        notify(ctx, lastDecisions.map(decision => `${decision.id}:${decision.tool}:${decision.action} ` +
+          `call=${decision.keepCall.toFixed(2)} result=${decision.keepResult.toFixed(2)}`).join('\n') || 'no decisions yet');
+      } else if (command === 'compact' || command === 'prune') {
+        await ctx.waitForIdle();
+        requestCompaction(ctx);
+      } else if (command === 'on' || command === 'off') {
+        invalidate();
+        enabled = command === 'on';
+        pi.appendEntry(SETTINGS_ENTRY, { enabled });
         showStatus(ctx);
+        notify(ctx, enabled ? 'on' : 'off; existing compacted context remains available');
+      } else {
+        notify(ctx, 'usage: /jev status|decisions|compact|on|off; /compact also uses Jev');
       }
-      return { messages: original };
-    } finally {
-      transport?.dispose();
-      if (active === transport) active = undefined;
-    }
+    },
   });
 }

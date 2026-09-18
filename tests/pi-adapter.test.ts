@@ -2,8 +2,19 @@ import { describe, expect, it } from 'vitest';
 
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 
-import { type JevAsker, type JevQuestions } from '../src/index.js';
-import { applyPiEdits, compactPiMessages, type PiEdit } from '../pi/adapter.js';
+import {
+  compact,
+  reductionRatio,
+  type JevAsker,
+  type JevQuestions,
+  type Message,
+} from '../src/index.js';
+import {
+  applyPiEdits,
+  compactPiMessages,
+  projectPiMessages,
+  type PiEdit,
+} from '../pi/adapter.js';
 
 const usage = {
   input: 1,
@@ -18,7 +29,10 @@ function user(text: string): AgentMessage {
   return { role: 'user', content: text, timestamp: 1 } as AgentMessage;
 }
 
-function toolCall(id: string, extras: Record<string, unknown> = {}): Record<string, unknown> {
+function toolCall(
+  id: string,
+  extras: Record<string, unknown> = {},
+): Record<string, unknown> {
   return { type: 'toolCall', id, name: 'read', arguments: { path: `${id}.ts` }, ...extras };
 }
 
@@ -52,9 +66,14 @@ function toolResult(
   } as AgentMessage;
 }
 
-function fakeJev(answer: (question: string) => number, seen: string[] = []): JevAsker {
+function fakeJev(
+  answer: (question: string) => number,
+  seen: string[] = [],
+  states: unknown[] = [],
+): JevAsker {
   return {
-    async ask(_state, questions: JevQuestions) {
+    async ask(state, questions: JevQuestions) {
+      states.push(state);
       const names = Object.keys(questions);
       seen.push(...names);
       return {
@@ -66,258 +85,268 @@ function fakeJev(answer: (question: string) => number, seen: string[] = []): Jev
   };
 }
 
-function resultMessage(message: AgentMessage): Record<string, unknown> {
-  expect(message.role).toBe('toolResult');
+function resultText(messages: readonly Message[], id: string): string | undefined {
+  for (const message of messages) {
+    for (const result of message.toolResults ?? []) {
+      if (result.tool_use_id === id) return result.text;
+    }
+  }
+  return undefined;
+}
+
+function rawResult(messages: readonly AgentMessage[], id: string): Record<string, unknown> {
+  const message = messages.find(
+    (candidate) => candidate.role === 'toolResult' && candidate.toolCallId === id,
+  );
+  expect(message).toBeDefined();
   return message as unknown as Record<string, unknown>;
 }
 
-describe('Pi adapter', () => {
-  it('keeps tool-call/result pairing when a call is dropped', async () => {
-    const messages = [
-      user('fix the actual request'),
-      assistant([{ type: 'text', text: 'running a read' }, toolCall('old')]),
-      toolResult('old', 'x'.repeat(500)),
-      user('continue'),
+describe('Pi adapter native parity', () => {
+  it('projects visible assistant text without leaking reasoning or signatures', () => {
+    const raw = [
+      user('inspect this'),
+      assistant([
+        { type: 'thinking', thinking: 'First consider the caller.', thinkingSignature: 'opaque-thinking' },
+        { type: 'text', text: 'Then read the file.', textSignature: 'opaque-text' },
+        toolCall('read', { thoughtSignature: 'opaque-tool' }),
+      ]),
+      toolResult('read', 'source'),
     ];
 
-    const output = await compactPiMessages(messages, fakeJev(() => 0.1), {
-      preserveRecentMessages: 0,
+    const projected = projectPiMessages(raw, 0);
+    expect(projected[1]).toMatchObject({
+      role: 'assistant',
+      text: 'Then read the file.',
+      toolUses: [{ tool_use_id: 'read', tool: 'read', input: { path: 'read.ts' } }],
     });
-
-    expect(output.edits).toHaveLength(1);
-    expect(output.edits[0]).toMatchObject({ toolCallId: 'old', action: 'drop_call' });
-    expect(output.messages).toHaveLength(3);
-    expect((output.messages[1] as any).content).toEqual([{ type: 'text', text: 'running a read' }]);
-    expect(output.messages.some((message) => message.role === 'toolResult')).toBe(false);
-    expect((messages[1] as any).content).toHaveLength(2);
-    expect(messages[2]).toMatchObject({ role: 'toolResult', toolCallId: 'old' });
+    expect(JSON.stringify(projected)).not.toContain('opaque-thinking');
+    expect(JSON.stringify(projected)).not.toContain('opaque-text');
+    expect(JSON.stringify(projected)).not.toContain('opaque-tool');
   });
 
-  it('only replaces a plain result text block and preserves all result metadata', async () => {
-    const details = { source: 'filesystem', retained: true };
-    const resultUsage = { ...usage, input: 8, totalTokens: 9 };
-    const messages = [
-      user('start'),
-      assistant([toolCall('long')]),
-      toolResult('long', 'a'.repeat(600), { details, usage: resultUsage, timestamp: 999, custom: 'kept' }),
-      user('continue'),
+  it('matches native decisions, truncation, stats, and reduction ratio with GPT thinking and signed blocks', async () => {
+    const gone = toolCall('gone', { thoughtSignature: 'signed-tool-call' });
+    const trim = toolCall('trim');
+    const thinking = { type: 'thinking', thinking: 'reason through the files', thinkingSignature: 'signed-thinking' };
+    const signedText = { type: 'text', text: 'I will inspect both files.', textSignature: 'signed-text' };
+    const longError = 'failure detail '.repeat(100);
+    const raw = [
+      user('Fix the requested issue.'),
+      assistant([thinking, signedText, gone, trim]),
+      toolResult('gone', 'obsolete read output '.repeat(80), { custom: 'gone-result' }),
+      toolResult('trim', longError, { isError: true, details: { source: 'tool' }, custom: 'trim-result' }),
+      user('Continue.'),
     ];
+    const answers = (question: string): number => {
+      if (question === 'call_t1' || question === 'result_t1') return 0.1;
+      if (question === 'call_t2') return 0.9;
+      return 0.1;
+    };
+    const options = { preserveRecentMessages: 0, truncateHeadChars: 40 };
+    const native = await compact(projectPiMessages(raw, 0), fakeJev(answers), options);
+    const adapted = await compactPiMessages(raw, fakeJev(answers), options);
 
+    expect(adapted.decisions).toEqual(native.decisions);
+    const { ms: _nativeMs, ...nativeStats } = native.stats;
+    const { ms: _adaptedMs, ...adaptedStats } = adapted.stats;
+    expect(adaptedStats).toEqual(nativeStats);
+    expect(reductionRatio({ stats: adapted.stats })).toBe(reductionRatio(native));
+    expect(projectPiMessages(adapted.messages, 0)).toEqual(native.messages);
+    expect(adapted.edits.map((edit) => [edit.toolCallId, edit.action])).toEqual([
+      ['gone', 'drop_call'],
+      ['trim', 'drop_result'],
+    ]);
+
+    const outputAssistant = adapted.messages[1] as unknown as Record<string, unknown>;
+    const outputContent = outputAssistant.content as unknown[];
+    expect(outputContent).toEqual([thinking, signedText, trim]);
+    expect(outputContent[0]).toBe(thinking);
+    expect(outputContent[1]).toBe(signedText);
+    expect(adapted.messages.some((message) => message.role === 'toolResult' && message.toolCallId === 'gone')).toBe(false);
+
+    const changed = rawResult(adapted.messages, 'trim');
+    expect(changed.isError).toBe(true);
+    expect(changed.details).toEqual({ source: 'tool' });
+    expect(changed.custom).toBe('trim-result');
+    expect(changed.content).toEqual([{ type: 'text', text: resultText(native.messages, 'trim') }]);
+    expect(resultText(native.messages, 'trim')).toContain('(error)');
+  });
+
+  it('scores thinking, signatures, errors, multimodal output, and deferred-tool metadata instead of excluding them', async () => {
+    const ids = ['thinking', 'signed', 'error', 'media', 'deferred', 'preserved'];
+    const preservedCall = toolCall('preserved', { thoughtSignature: 'keep-tool-s' });
+    const raw = [
+      user('start'),
+      assistant([{ type: 'thinking', thinking: 'reasoning', thinkingSignature: 's' }, toolCall('thinking')]),
+      toolResult('thinking', 't'.repeat(500)),
+      assistant([{ type: 'text', text: 'signed', textSignature: 's' }, toolCall('signed', { thoughtSignature: 's' })]),
+      toolResult('signed', 's'.repeat(500)),
+      assistant([toolCall('error')], { stopReason: 'error' }),
+      toolResult('error', 'e'.repeat(500), { isError: true }),
+      assistant([toolCall('media')]),
+      {
+        role: 'toolResult', toolCallId: 'media', toolName: 'read',
+        content: [{ type: 'text', text: 'image caption' }, { type: 'image', data: 'base64-secret', mimeType: 'image/png' }],
+        isError: false, timestamp: 3,
+      } as AgentMessage,
+      assistant([toolCall('deferred')]),
+      toolResult('deferred', 'd'.repeat(500), { addedToolNames: ['later-tool'] }),
+      assistant([{ type: 'thinking', thinking: 'keep reasoning', thinkingSignature: 'keep-s' }, preservedCall]),
+      toolResult('preserved', 'p'.repeat(500)),
+    ];
+    const seen: string[] = [];
+    const output = await compactPiMessages(raw, fakeJev((question) => {
+      if (question === 'call_t6') return 0.9;
+      return 0.1;
+    }, seen), { preserveRecentMessages: 0, truncateHeadChars: 30 });
+
+    expect(seen).toHaveLength(ids.length * 2);
+    expect(output.edits.map((edit) => edit.toolCallId)).toEqual(ids);
+    for (const id of ids.filter((id) => id !== 'preserved')) {
+      expect(output.messages.some((message) => message.role === 'toolResult' && message.toolCallId === id)).toBe(false);
+    }
+    expect(output.messages.some(
+      (message) => message.role === 'assistant' && (message as any).content?.[0]?.thinking === 'reasoning',
+    )).toBe(false);
+    const thinkingAssistant = output.messages.find(
+      (message) => message.role === 'assistant' && (message as any).content?.[0]?.thinking === 'keep reasoning',
+    ) as any;
+    expect(thinkingAssistant.content).toEqual([
+      { type: 'thinking', thinking: 'keep reasoning', thinkingSignature: 'keep-s' },
+      preservedCall,
+    ]);
+    expect(rawResult(output.messages, 'preserved').content).toEqual([
+      { type: 'text', text: expect.stringContaining('[fast-jev-compaction truncated ') },
+    ]);
+  });
+
+  it('uses a non-leaking multimodal projection and removes images when native truncation changes the result', async () => {
+    const imageData = 'TOP-SECRET-IMAGE-BYTES';
+    const multi = {
+      role: 'toolResult',
+      toolCallId: 'media',
+      toolName: 'read',
+      content: [
+        { type: 'text', text: 'first text '.repeat(50) },
+        { type: 'image', data: imageData, mimeType: 'image/png' },
+        { type: 'text', text: 'second text '.repeat(50) },
+      ],
+      details: { retained: true },
+      addedToolNames: ['loaded-later'],
+      isError: false,
+      timestamp: 3,
+    } as AgentMessage;
+    const raw = [user('start'), assistant([toolCall('media')]), multi, user('continue')];
+    const states: unknown[] = [];
+    const options = { preserveRecentMessages: 0, truncateHeadChars: 30 };
+    const native = await compact(
+      projectPiMessages(raw, 0),
+      fakeJev((question) => (question.startsWith('call_') ? 0.9 : 0.1)),
+      options,
+    );
     const output = await compactPiMessages(
-      messages,
-      fakeJev((name) => (name.startsWith('call_') ? 0.9 : 0.1)),
-      { preserveRecentMessages: 0, truncateHeadChars: 40 },
+      raw,
+      fakeJev((question) => (question.startsWith('call_') ? 0.9 : 0.1), [], states),
+      options,
     );
 
-    expect(output.edits).toHaveLength(1);
-    expect(output.edits[0]?.action).toBe('drop_result');
-    expect(output.messages[1]).toBe(messages[1]);
-    expect(output.messages[2]).not.toBe(messages[2]);
-    const changed = resultMessage(output.messages[2]!);
-    const original = resultMessage(messages[2]!);
-    expect(changed.details).toBe(details);
-    expect(changed.usage).toBe(resultUsage);
-    expect(changed.timestamp).toBe(999);
-    expect(changed.custom).toBe('kept');
-    expect((changed.content as any[])[0]).toEqual({
-      type: 'text',
-      text: output.edits[0]?.text,
-    });
-    expect((original.content as any[])[0]?.text).toBe('a'.repeat(600));
+    expect(JSON.stringify(states)).not.toContain(imageData);
+    const changed = rawResult(output.messages, 'media');
+    expect(changed.content).toEqual([{ type: 'text', text: resultText(native.messages, 'media') }]);
+    expect(JSON.stringify(changed.content)).not.toContain(imageData);
+    expect(changed.details).toEqual({ retained: true });
+    expect(changed.addedToolNames).toEqual(['loaded-later']);
   });
 
-  it('protects the first and newest source rows before Jev is asked', async () => {
-    const messages = [
-      assistant([toolCall('first')]),
-      toolResult('first', 'f'.repeat(500)),
-      user('middle'),
-      assistant([toolCall('old')]),
-      toolResult('old', 'o'.repeat(500)),
-      assistant([toolCall('recent')]),
-      toolResult('recent', 'r'.repeat(500)),
-    ];
-    const seen: string[] = [];
-
-    const output = await compactPiMessages(messages, fakeJev(() => 0.1, seen), {
-      preserveRecentMessages: 2,
-    });
-
-    expect(seen).toHaveLength(2);
-    expect(output.edits).toEqual([
-      expect.objectContaining({ toolCallId: 'old', action: 'drop_call' }),
-    ]);
-    expect(output.messages.some((message) => (message as any).toolCallId === 'first')).toBe(true);
-    expect(output.messages.some((message) => (message as any).toolCallId === 'recent')).toBe(true);
-  });
-
-  it('keeps one projection row for unsupported messages and does not score duplicate or unpaired IDs', async () => {
-    const custom = { role: 'compactionSummary', summary: 'opaque session entry', timestamp: 2 } as AgentMessage;
-    const good = [user('start'), custom, assistant([toolCall('good')]), toolResult('good', 'g'.repeat(500))];
-    const compacted = await compactPiMessages(good, fakeJev(() => 0.1), { preserveRecentMessages: 0 });
-    expect(compacted.stats.messagesBefore).toBe(good.length);
-    expect(compacted.messages[1]).toBe(custom);
-
-    const duplicate = [
+  it('keeps short multimodal results when native drop_result is a no-op, and when Jev keeps them', async () => {
+    const image = { type: 'image', data: 'short-image-bytes', mimeType: 'image/png' };
+    const raw = [
       user('start'),
-      assistant([toolCall('same')]),
-      toolResult('same', 'a'.repeat(500)),
-      assistant([toolCall('same')]),
-      toolResult('same', 'b'.repeat(500)),
-      assistant([toolCall('unpaired')]),
+      assistant([toolCall('short-media')]),
+      {
+        role: 'toolResult',
+        toolCallId: 'short-media',
+        toolName: 'read',
+        content: [{ type: 'text', text: 'short caption' }, image],
+        isError: false,
+        timestamp: 3,
+      } as AgentMessage,
+      user('continue'),
     ];
-    const seen: string[] = [];
-    const untouched = await compactPiMessages(duplicate, fakeJev(() => 0.1, seen), {
-      preserveRecentMessages: 0,
-    });
-    expect(seen).toEqual([]);
-    expect(untouched.edits).toEqual([]);
-    expect(untouched.messages).toHaveLength(duplicate.length);
-    expect(untouched.messages.every((message, index) => message === duplicate[index])).toBe(true);
+    const options = { preserveRecentMessages: 0, truncateHeadChars: 30 };
+    const noOp = await compactPiMessages(
+      raw,
+      fakeJev((question) => (question.startsWith('call_') ? 0.9 : 0.1)),
+      options,
+    );
+    const kept = await compactPiMessages(raw, fakeJev(() => 0.9), options);
+
+    expect(noOp.decisions[0]?.action).toBe('drop_result');
+    expect(noOp.edits).toEqual([]);
+    expect(noOp.messages[2]).toBe(raw[2]);
+    expect((rawResult(noOp.messages, 'short-media').content as unknown[])[1]).toBe(image);
+    expect(kept.decisions[0]?.action).toBe('keep');
+    expect(kept.edits).toEqual([]);
+    expect(kept.messages[2]).toBe(raw[2]);
   });
 
-  it('does not score thinking, signed, future-content, failed, multimodal, error, or added-tool call groups', async () => {
-    const imageResult = {
-      role: 'toolResult',
-      toolCallId: 'image',
-      toolName: 'read',
-      content: [{ type: 'text', text: 'text' }, { type: 'image', data: 'abc', mimeType: 'image/png' }],
-      isError: false,
-      timestamp: 4,
-    } as AgentMessage;
-    const messages = [
-      user('start'),
-      assistant([{ type: 'thinking', thinking: 'private reasoning' }, toolCall('thinking')]),
-      toolResult('thinking', 't'.repeat(500)),
-      assistant([{ type: 'text', text: 'signed', textSignature: 's' }, toolCall('signed')]),
-      toolResult('signed', 's'.repeat(500)),
-      assistant([toolCall('image')]),
-      imageResult,
-      assistant([toolCall('error')]),
-      toolResult('error', 'e'.repeat(500), { isError: true }),
-      assistant([toolCall('added')]),
-      toolResult('added', 'a'.repeat(500), { addedToolNames: ['new-tool'] }),
-      assistant([{ type: 'image', data: 'opaque', mimeType: 'image/png' }, toolCall('future')]),
-      toolResult('future', 'f'.repeat(500)),
-      assistant([toolCall('failed')], { stopReason: 'error' }),
-      toolResult('failed', 'f'.repeat(500)),
-    ];
-    const seen: string[] = [];
+  it('uses the native no-op result decision and native stats for short output', async () => {
+    const raw = [user('start'), assistant([toolCall('short')]), toolResult('short', 'small'), user('continue')];
+    const options = { preserveRecentMessages: 0 };
+    const answer = (question: string): number => question.startsWith('call_') ? 0.9 : 0.1;
+    const native = await compact(projectPiMessages(raw, 0), fakeJev(answer), options);
+    const output = await compactPiMessages(raw, fakeJev(answer), options);
 
-    const output = await compactPiMessages(messages, fakeJev(() => 0.1, seen), {
-      preserveRecentMessages: 0,
-    });
-
-    expect(seen).toEqual([]);
+    expect(native.decisions[0]?.action).toBe('drop_result');
     expect(output.edits).toEqual([]);
-    expect(output.messages.every((message, index) => message === messages[index])).toBe(true);
+    const { ms: _nativeMs, ...nativeStats } = native.stats;
+    const { ms: _outputMs, ...outputStats } = output.stats;
+    expect(outputStats).toEqual(nativeStats);
+    expect(output.stats.resultsDropped).toBe(1);
+    expect(output.messages.every((message, index) => message === raw[index])).toBe(true);
   });
 
-  it('retains summaries and safe descriptions of unscored calls in Jev state', async () => {
-    const protectedOutput = 'TOP SECRET TOOL OUTPUT '.repeat(40);
-    const visibleBashOutput = 'DO NOT SEND BASH OUTPUT '.repeat(20);
-    const excludedBashOutput = 'EXCLUDED OUTPUT '.repeat(20);
-    const messages = [
-      user('fix the actual request'),
-      { role: 'compactionSummary', summary: 'Never modify generated files.', tokensBefore: 999, timestamp: 2 } as AgentMessage,
-      { role: 'branchSummary', summary: 'We returned to the migration branch.', fromId: 'old', timestamp: 3 } as AgentMessage,
-      {
-        role: 'bashExecution', command: 'git status --short', output: visibleBashOutput,
-        exitCode: 0, cancelled: false, truncated: false, timestamp: 4,
-      } as AgentMessage,
-      {
-        role: 'bashExecution', command: 'echo hidden-command', output: excludedBashOutput,
-        exitCode: 0, cancelled: false, truncated: false, excludeFromContext: true, timestamp: 5,
-      } as AgentMessage,
-      assistant([{ type: 'thinking', thinking: 'signed context' }, toolCall('protected')]),
-      toolResult('protected', protectedOutput),
-      assistant([toolCall('candidate')]),
-      toolResult('candidate', 'c'.repeat(500)),
-    ];
-    let state: unknown;
-    const asker: JevAsker = {
-      async ask(nextState, questions: JevQuestions) {
-        state = nextState;
-        return {
-          answers: Object.fromEntries(
-            Object.keys(questions).map((name) => [name, { type: 'noul' as const, noul: 0.1 }]),
-          ),
-        };
-      },
-    };
-
-    const output = await compactPiMessages(messages, asker, { preserveRecentMessages: 0 });
-    const serialized = JSON.stringify(state);
-
-    expect(output.edits).toEqual([
-      expect.objectContaining({ toolCallId: 'candidate', action: 'drop_call' }),
-    ]);
-    expect((state as any).goal).toBe('fix the actual request');
-    expect(serialized).toContain('Never modify generated files.');
-    expect(serialized).toContain('We returned to the migration branch.');
-    expect(serialized).toContain('git status --short');
-    expect(serialized).toContain('protected');
-    expect(serialized).toContain('args=');
-    expect(serialized).toContain('protected.ts');
-    expect(serialized).toContain('chars of output omitted');
-    expect(serialized).not.toContain(protectedOutput);
-    expect(serialized).not.toContain(visibleBashOutput);
-    expect(serialized).not.toContain('hidden-command');
-    expect(serialized).not.toContain(excludedBashOutput);
-  });
-
-  it('does not pair a result before its call or a result with another tool name', async () => {
-    const messages = [
+  it('only skips non-unique or out-of-order ids; a mismatched display name is still a valid pair', async () => {
+    const raw = [
       user('start'),
       toolResult('early', 'e'.repeat(500)),
       assistant([toolCall('early')]),
-      assistant([toolCall('wrong')]),
-      toolResult('wrong', 'w'.repeat(500), { toolName: 'different-tool' }),
-      assistant([toolCall('candidate')]),
-      toolResult('candidate', 'c'.repeat(500)),
+      assistant([toolCall('mismatch')]),
+      toolResult('mismatch', 'm'.repeat(500), { toolName: 'different-name' }),
+      assistant([toolCall('duplicate'), toolCall('duplicate')]),
+      toolResult('duplicate', 'd'.repeat(500)),
+      assistant([toolCall('pinned')]),
+      toolResult('pinned', 'p'.repeat(500)),
     ];
     const seen: string[] = [];
-
-    const output = await compactPiMessages(messages, fakeJev(() => 0.1, seen), {
-      preserveRecentMessages: 0,
+    const output = await compactPiMessages(raw, fakeJev(() => 0.1, seen), {
+      preserveRecentMessages: 2,
     });
 
-    expect(seen).toHaveLength(2);
-    expect(output.edits).toEqual([
-      expect.objectContaining({ toolCallId: 'candidate', action: 'drop_call' }),
-    ]);
-    expect(output.messages.some((message) => (message as any).toolCallId === 'early')).toBe(true);
-    expect(output.messages.some((message) => (message as any).toolCallId === 'wrong')).toBe(true);
+    expect(seen).toEqual(['call_t1', 'result_t1']);
+    expect(output.edits).toEqual([expect.objectContaining({ toolCallId: 'mismatch', action: 'drop_call' })]);
+    expect(output.messages.some((message) => message.role === 'toolResult' && message.toolCallId === 'early')).toBe(true);
+    expect(output.messages.some((message) => message.role === 'toolResult' && message.toolCallId === 'duplicate')).toBe(true);
+    expect(output.messages.some((message) => message.role === 'toolResult' && message.toolCallId === 'pinned')).toBe(true);
   });
 
-  it('does not persist a no-op drop_result for short output', async () => {
-    const messages = [user('start'), assistant([toolCall('short')]), toolResult('short', 'small'), user('continue')];
-    const output = await compactPiMessages(
-      messages,
-      fakeJev((name) => (name.startsWith('call_') ? 0.9 : 0.1)),
-      { preserveRecentMessages: 0 },
-    );
-
-    expect(output.edits).toEqual([]);
-    expect(output.stats.resultsDropped).toBe(0);
-    expect(output.messages.every((message, index) => message === messages[index])).toBe(true);
-  });
-
-  it('rejects stale or forged cached edits before modifying the raw transcript', async () => {
+  it('rejects stale paired content and forged cached result replacements', async () => {
     const raw = [user('start'), assistant([toolCall('safe')]), toolResult('safe', 'z'.repeat(600)), user('continue')];
     const compacted = await compactPiMessages(
       raw,
-      fakeJev((name) => (name.startsWith('call_') ? 0.9 : 0.1)),
+      fakeJev((question) => (question.startsWith('call_') ? 0.9 : 0.1)),
       { preserveRecentMessages: 0, truncateHeadChars: 20 },
     );
     const cached = compacted.edits[0]!;
     expect(cached.action).toBe('drop_result');
 
-    const nowSigned = [...raw];
-    nowSigned[1] = assistant([{ type: 'thinking', thinking: 'new protected group' }, toolCall('safe')]);
-    const stale = applyPiEdits(nowSigned, [cached], 0);
-    expect(stale.every((message, index) => message === nowSigned[index])).toBe(true);
+    const changed = [...raw];
+    changed[2] = toolResult('safe', 'changed '.repeat(100));
+    const stale = applyPiEdits(changed, [cached], 0);
+    expect(stale.every((message, index) => message === changed[index])).toBe(true);
 
-    const forged: PiEdit = { ...cached, text: 'replace this with arbitrary text' };
+    const forged: PiEdit = { ...cached, text: 'arbitrary replacement' };
     const untouched = applyPiEdits(raw, [forged], 0);
     expect(untouched.every((message, index) => message === raw[index])).toBe(true);
   });

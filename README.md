@@ -127,39 +127,47 @@ stage was needed, and the number of requests.
 ## Pi extension
 
 The Pi package exposes `pi/extension.ts` through its `package.json` manifest.
-It uses Pi's `context` hook to create a pruned copy only for the next model
-request. It does not replace session entries: the JSONL session still contains
-the complete original conversation, and a cached pruning decision is saved as
-a branch-scoped custom entry so it can be restored after a reload or `/tree`
-navigation.
+It runs Jev at Pi's compaction boundary, not before every model request. The
+adapter uses the same paired-call decisions and first/recent-message pinning as
+the core compactor, then applies those decisions to Pi's typed messages.
 
-Pi's own `/compact`, automatic compaction, overflow recovery, and branch
-summaries remain native Pi behavior. This extension does not supply a custom
-compaction summary. If Jev is unavailable, a request is cancelled, a response
-is malformed, or a stored decision no longer matches the active transcript,
-the extension forwards the original context and Pi keeps its usual compaction
-fallback available.
+`/compact`, `/jev compact`, and `/jev prune` all request the same Pi
+compaction path. The extension also asks Pi to compact after a settled turn
+when context reaches 60% by default. Pi's own threshold compaction and
+overflow recovery flow through that same `session_before_compact` hook.
 
-Only a complete, one-to-one tool-call/result pair is eligible. The adapter
-pins the first row and the configured recent rows, and refuses to edit rows
-with images, errors, thinking blocks, signatures, non-text/multi-part results,
-or tool-discovery metadata. It also keeps a call and its result paired. These
-guards are deliberate: a decision that cannot be replayed without changing
-Pi's message structure is discarded instead of partially applied.
+Jev replaces Pi's summary only when scoring succeeds and removes at least 25%
+of the projected character count. A missing key, malformed response, request
+failure, host capacity gate, or smaller reduction leaves Pi's native summary
+in control. Cancellation stays a normal Pi cancellation; it is not converted
+into a Jev or native summary.
+
+The resulting compaction entry stores typed retained messages in `details` and
+a complete deterministic retained-text rendering in its required summary. The
+`context` hook only restores a committed checkpoint; it never scores or
+revisits old decisions. Original messages remain in the prior JSONL entries,
+so `/tree` can return to the point before compaction. Existing checkpoints
+continue to restore even after `/jev off`.
+
+Every unique, ordered tool-call/result pair is a core candidate, including
+errors, image-bearing results, and tool-discovery results. Visible assistant
+text and message metadata survive edits. If removing calls leaves an assistant
+row with no visible text or remaining calls, that row is removed with its now
+orphaned reasoning/signature blocks, matching the native empty-row rule and
+avoiding a Responses reasoning-only item.
 
 ### Privacy and API data
 
-Jev receives conversation text, Pi compaction and branch summaries, non-excluded
-`!` bash commands, and tool names and arguments (including protected calls).
-For scoring, every tool output body is replaced with a short length/status
-note; output bodies are not sent to the TypeSafe API. A `!!` bash execution
-marked `excludeFromContext` is omitted from the scoring input. Set
-`TYPESAFE_API_KEY` only if that text, those summaries, commands, and tool
-arguments may be sent to TypeSafe.
+Jev receives projected visible conversation text, Pi compaction and branch
+summary text, non-excluded `!` bash commands and output, plus tool names and
+arguments. Tool-result bodies are represented as status/length notes in the
+Jev state. Image payload bytes are never sent; the projection uses count
+placeholders. A `!!` execution marked `excludeFromContext` is omitted. Set
+`TYPESAFE_API_KEY` only if the remaining projected text, summaries, commands,
+and tool arguments may be sent to TypeSafe.
 
-The status line may report `~N tokens removed`. That is an approximate context
-size estimate based on the message content forwarded to Pi, not a tokenizer
-measurement or a claim about response time.
+Reduction shown by `/jev status` is based on the core projection. It is an
+estimate for compaction eligibility, not a tokenizer or response-time metric.
 
 ### Install
 
@@ -185,8 +193,28 @@ pi install git:github.com/MiguelMachado-dev/fast-jev-compaction@feat/pi-extensio
 ```
 
 Set `TYPESAFE_API_KEY` in the environment that starts Pi. Without a key the
-extension is inert, leaves context unchanged, and `/jev status` reports that
-the key is missing.
+extension lets Pi produce its native summary and `/jev status` reports the
+missing key.
+
+For an interactive Windows check with the user's existing `openai-codex`
+authentication and `gpt-6-astra` at `xhigh`, use:
+
+```powershell
+.\scripts\test-pi.ps1
+```
+
+The launcher prompts securely for `TYPESAFE_API_KEY` only when it is absent,
+passes it only to its Pi child process, and writes no configuration. It starts
+Pi without an initial prompt. To print a reproducible read-only test prompt
+without starting a model request, run:
+
+```powershell
+.\scripts\test-pi.ps1 -ShowCompactionPrompt
+```
+
+Paste that prompt into Pi, wait for the explanation, then enter `/compact`.
+The expected outcome is either a Jev checkpoint with at least 25% projected
+reduction or Pi's normal summary fallback.
 
 ### Configuration
 
@@ -194,28 +222,30 @@ Pi loads these extension flags from the command line:
 
 | Flag | Default | Meaning |
 | --- | ---: | --- |
-| `--jev-min-tokens` | `20000` | Approximate context size that enables automatic scoring. |
-| `--jev-preserve-recent` | `6` | Newest message rows that are never edited. |
-| `--jev-timeout-ms` | `10000` | Deadline for one complete scoring pass, from 1 to 120000 ms. |
-| `--jev-keep-threshold` | `0.5` | Minimum Jev probability required to keep a call or full result, from 0 to 1. |
+| `--jev-compact-at-percent` | `60` | Context percentage that queues compaction after a settled turn. |
+| `--jev-min-reduction-ratio` | `0.25` | Minimum projected character reduction needed to replace Pi's summary. |
+| `--jev-keep-threshold` | `0.5` | Minimum probability required to keep a call or full result. |
+| `--jev-preserve-recent` | `6` | Newest message rows pinned by the core compactor. |
+| `--jev-max-state-tokens` | `25000` | Estimated Jev state budget. |
+| `--jev-max-request-tokens` | `30000` | Estimated Jev request budget. |
+| `--jev-truncate-head-chars` | `300` | Characters retained before a truncated result marker. |
+| `--jev-timeout-ms` | `0` | Optional scoring deadline in milliseconds; `0` disables this extra deadline. |
+| `--jev-model` | `jev-latest` | TypeSafe model used for scoring. |
 | `--jev-disabled` | `false` | Starts the extension disabled. |
 
-For example: `pi --jev-min-tokens 24000 --jev-preserve-recent 8`.
+For example: `pi --jev-compact-at-percent 70 --jev-preserve-recent 8`.
 
 Use the `/jev` command inside Pi:
 
 | Command | Effect |
 | --- | --- |
-| `/jev status` | Shows whether pruning can run, whether a key is configured, and the cached edit count. |
-| `/jev prune` | Queues a forced rescore for the next model request; it does not make an LLM request by itself. |
-| `/jev on` / `/jev off` | Enables or disables automatic pruning for the active branch. |
-| `/jev reset` / `/jev restore` | Clears cached edits and keeps automatic pruning enabled if it was enabled. |
+| `/jev status` | Shows Jev/native status, key state, automatic threshold, and minimum reduction. |
+| `/jev decisions` | Shows the latest core decisions and probabilities. |
+| `/jev compact` / `/jev prune` | Requests the same Pi compaction path as `/compact`. |
+| `/jev on` / `/jev off` | Enables or disables future Jev scoring; committed checkpoints still restore. |
 
-After a successful score, the extension reuses the same edits until a new user
-prompt arrives, eight new message rows appear, or `/jev prune` forces a new
-score. `/tree` navigation restores the cached edits for the newly active
-branch. Native Pi compaction, malformed persisted state, and configuration
-changes invalidate a cache.
+Use `/tree` to navigate to the pre-checkpoint entry when you need the original
+uncompacted branch context.
 
 ## Claude Code plugin
 

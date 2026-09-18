@@ -17,10 +17,13 @@ export function createJevTransport(
   timeoutMs: number,
   parentSignal?: AbortSignal,
   fetcher: typeof fetch = fetch,
+  model?: string,
 ): { asker: JevAsker; signal: AbortSignal; abort(): void; dispose(): void } {
   const controller = new AbortController();
   const abort = () => controller.abort(new Error('Jev request cancelled'));
-  const timer = setTimeout(() => controller.abort(new Error('Jev deadline exceeded')), timeoutMs);
+  const timer = timeoutMs > 0
+    ? setTimeout(() => controller.abort(new Error('Jev deadline exceeded')), timeoutMs)
+    : undefined;
   parentSignal?.addEventListener('abort', abort, { once: true });
   if (parentSignal?.aborted) abort();
 
@@ -37,7 +40,7 @@ export function createJevTransport(
       async ask(state, questions) {
         controller.signal.throwIfAborted();
         if (!apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
-        const request = buildJevRequest({ apiKey }, state, questions);
+        const request = buildJevRequest({ apiKey, model }, state, questions);
         return abortable((async () => {
           const response = await fetcher(request.url, {
             method: request.method,
