@@ -30,6 +30,20 @@ restored.
 The readable checkpoint also carries Pi's read/modified file lists so a later
 native summary can see file operations from the complete compacted context.
 
+Version 2 checkpoints also retain a bounded, addressable source window for
+Pi's compaction preparation, which runs before the extension hook. This keeps
+a second compact available after a short new turn. The context hook replaces
+the covered window with the typed snapshot; it does not send both copies to
+the model. Raw Pi entry-size estimates may include the source window, whereas
+`/jev status` uses the effective projection. Actual provider usage comes from
+the following model response.
+
+On native fallback, the adapter replaces the preparation's covered source
+with the retained transcript and the new prefix. The previous checkpoint is
+included even when Pi splits the first new turn, including fallback with
+`/jev off`, missing credentials, or insufficient reduction. Version 1
+checkpoints remain readable and receive the same fallback protection.
+
 The adapter runs the same core paired-call decisions for every unique,
 ordered tool-call/result pair, including errors, images, and tool discovery.
 It preserves visible text and message metadata. When a dropped tool call would

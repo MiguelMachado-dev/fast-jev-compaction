@@ -87,6 +87,27 @@ function addValidCompaction(session: SessionManager, checkpoint = createCheckpoi
 }
 
 describe('Pi checkpoint persistence', () => {
+  it('replaces the v2 source interval exactly once and keeps only messages after its commit', () => {
+    const session = SessionManager.inMemory(process.cwd());
+    const root = session.appendMessage({ role: 'user', content: 'SOURCE-ORIGINAL', timestamp: 0 } as any);
+    const checkpoint = createCheckpoint(messages(), stats, {
+      read: new Set(), written: new Set(), edited: new Set(),
+    }, messages(), undefined, root);
+    session.appendCustomEntry('fast-jev-pi-boundary', { checkpointId: checkpoint.id });
+    const summary = renderCheckpoint(checkpoint);
+    session.appendCompaction(summary, root, 100, checkpoint, true);
+    const next = { role: 'user', content: 'New context.', timestamp: 9 } as const;
+    session.appendMessage(next);
+    const native = contextMessages(session);
+    expect(native).toHaveLength(3);
+    expect(restoreCheckpoints(native, session.getBranch())).toEqual([...checkpoint.messages, next]);
+    expect(JSON.stringify(restoreCheckpoints(native, session.getBranch()))).not.toContain('SOURCE-ORIGINAL');
+
+    session.branch(root);
+    session.appendMessage({ role: 'user', content: 'Sibling.', timestamp: 10 });
+    expect(restoreCheckpoints(native, session.getBranch())).toEqual(native);
+  });
+
   it('uses a real custom cutoff and restores a deep-cloned typed checkpoint', () => {
     const session = SessionManager.inMemory(process.cwd());
     const { checkpoint, boundary, summary } = addValidCompaction(session);

@@ -149,6 +149,19 @@ revisits old decisions. Original messages remain in the prior JSONL entries,
 so `/tree` can return to the point before compaction. Existing checkpoints
 continue to restore even after `/jev off`.
 
+Pi prepares compaction before calling extension hooks. Version 2 checkpoints
+therefore leave a bounded window of source entries addressable to that
+preparation, so another `/compact` can still reach Jev after a short new turn.
+The context hook replaces that entire window with the retained typed snapshot;
+source messages are not appended to the model's context a second time. Pi's
+raw entry-size estimates can include this window; `/jev status` reports the
+effective projection, and subsequent provider usage measures the actual request.
+
+Before native fallback, the adapter supplies the retained checkpoint and only
+the new prefix to Pi's summarizer. This also applies while Jev is disabled and
+when Pi splits the first turn after a checkpoint, preventing the previous
+context from being omitted. Existing version 1 checkpoints remain readable.
+
 Every unique, ordered tool-call/result pair is a core candidate, including
 errors, image-bearing results, and tool-discovery results. Visible assistant
 text and message metadata survive edits. If removing calls leaves an assistant

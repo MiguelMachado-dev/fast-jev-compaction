@@ -6,7 +6,7 @@ import { SessionManager, sessionEntryToContextMessages } from '@earendil-works/p
 import type { Message } from '@earendil-works/pi-ai';
 import { createCheckpoint, renderCheckpoint, restoreCheckpoints } from '../pi/checkpoint.js';
 
-it('restores typed context after closing and reopening a real Pi JSONL session', () => {
+it.each(['legacy', 'source'] as const)('restores a %s checkpoint after closing and reopening a real Pi JSONL session', format => {
   const directory = mkdtempSync(join(tmpdir(), 'fast-jev-pi-resume-'));
   try {
     const session = SessionManager.create(process.cwd(), directory);
@@ -26,20 +26,21 @@ it('restores typed context after closing and reopening a real Pi JSONL session',
         stopReason: 'stop', timestamp: 2,
       },
     ];
-    for (const message of messages) session.appendMessage(message);
+    const sourceIds = messages.map(message => session.appendMessage(message));
     const checkpoint = createCheckpoint(messages, {
       messagesBefore: 2, messagesAfter: 2, charsBefore: 100, charsAfter: 100,
       calls: 0, kept: 0, resultsDropped: 0, callsDropped: 0, pinned: 0,
       stateTokens: 0, stateStage: '', requests: 0, ms: 0,
-    }, { read: new Set(), written: new Set(), edited: new Set() });
+    }, { read: new Set(), written: new Set(), edited: new Set() }, messages, undefined,
+    format === 'source' ? sourceIds[0] : undefined);
     const boundary = session.appendCustomEntry('fast-jev-pi-boundary', { checkpointId: checkpoint.id });
-    session.appendCompaction(renderCheckpoint(checkpoint), boundary, 100, checkpoint, true);
+    session.appendCompaction(renderCheckpoint(checkpoint), checkpoint.sourceStartId ?? boundary, 100, checkpoint, true);
 
     const sessionFile = session.getSessionFile();
     expect(sessionFile).toBeDefined();
     const reopened = SessionManager.open(sessionFile!);
     const context = reopened.buildContextEntries().flatMap(sessionEntryToContextMessages);
-    expect(context).toHaveLength(1);
+    expect(context).toHaveLength(format === 'source' ? messages.length + 1 : 1);
     expect(context[0]?.role).toBe('compactionSummary');
     expect(restoreCheckpoints(context, reopened.getBranch())).toEqual(messages);
   } finally {

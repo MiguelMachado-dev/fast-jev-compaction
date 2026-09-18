@@ -6,6 +6,7 @@ import type { CompactOptions, CompactResult } from '../src/types.js';
 import { compactPiMessages } from './adapter.js';
 import { createCheckpoint, isJevCheckpoint, renderCheckpoint, restoreCheckpoints } from './checkpoint.js';
 import { createJevTransport } from './transport.js';
+import { prepareCheckpointFallback } from './fallback.js';
 
 const SETTINGS_ENTRY = 'fast-jev-pi-settings';
 const BOUNDARY_ENTRY = 'fast-jev-pi-boundary';
@@ -128,8 +129,16 @@ export default function registerPiExtension(pi: ExtensionAPI): void {
 
   pi.on('session_before_compact', async (event, ctx) => {
     if (!initialized) hydrate(ctx);
-    if (!enabled || !config) return;
+    const prepareFallback = () => prepareCheckpointFallback(event, () => {
+      pi.appendEntry('fast-jev-pi-native-cutoff', {});
+      const id = ctx.sessionManager.getLeafId();
+      if (!id) throw new Error('Missing native compaction cutoff');
+      return id;
+    });
+    // Previously committed checkpoints must also survive /jev off and bad flags.
+    if (!enabled || !config) { prepareFallback(); return; }
     const fallback = (reason: string) => {
+      prepareFallback();
       status = `fallback to Pi summary (${reason})`;
       notify(ctx, status, true);
       showStatus(ctx);
@@ -170,7 +179,26 @@ export default function registerPiExtension(pi: ExtensionAPI): void {
       const previousCompaction = [...branch].reverse().find(entry => entry.type === 'compaction');
       const previousFiles = previousCompaction?.type === 'compaction' && isJevCheckpoint(previousCompaction.details)
         ? previousCompaction.details : undefined;
-      const details = createCheckpoint(result.messages, result.stats, event.preparation.fileOps, messages, previousFiles);
+      // Keep source entries selectable: Pi can otherwise reject a second compact
+      // before it ever emits session_before_compact. The context hook replaces
+      // this complete source interval with the snapshot, without duplicating it.
+      // Retain the host's cut window plus one preceding message, not the entire
+      // original session. That preceding row keeps a future preparation nonempty
+      // even when all new messages fit inside keepRecentTokens. Back up over tool
+      // results to include their assistant call rather than exposing an orphan.
+      let sourceStart = branch.findIndex(entry => entry.id === event.preparation.firstKeptEntryId) - 1;
+      while (sourceStart >= 0) {
+        const entry = branch[sourceStart]!;
+        const message = entry.type === 'compaction' ? undefined : sessionEntryToContextMessages(entry)[0];
+        if (message && message.role !== 'toolResult') break;
+        sourceStart--;
+      }
+      const sourceStartId = sourceStart >= 0 ? branch[sourceStart]!.id :
+        branch.find(entry => sessionEntryToContextMessages(entry).length > 0)?.id;
+      if (!sourceStartId) throw new Error('Missing checkpoint source');
+      const details = createCheckpoint(result.messages, result.stats, event.preparation.fileOps, messages, previousFiles, sourceStartId);
+      if (event.willRetry && last?.role === 'assistant' &&
+          (last.stopReason === 'error' || last.stopReason === 'length')) details.omittedRetryResponse = true;
       details.decisions = result.decisions;
       const summary = renderCheckpoint(details);
       const safeBudget = ctx.model ? ctx.model.contextWindow - event.preparation.settings.reserveTokens : undefined;
@@ -182,13 +210,10 @@ export default function registerPiExtension(pi: ExtensionAPI): void {
         fallback('retained context still exceeds the model budget');
         return;
       }
-      // A custom entry is a real, non-message cutoff. The typed checkpoint holds
-      // the complete retained context; there is no duplicated original tail.
+      // This non-message boundary binds the snapshot to the covered source span.
       pi.appendEntry(BOUNDARY_ENTRY, { checkpointId: details.id });
-      const firstKeptEntryId = ctx.sessionManager.getLeafId();
-      if (!firstKeptEntryId) throw new Error('Missing checkpoint boundary');
       return {
-        compaction: { summary, firstKeptEntryId, tokensBefore: event.preparation.tokensBefore, details },
+        compaction: { summary, firstKeptEntryId: sourceStartId, tokensBefore: event.preparation.tokensBefore, details },
       };
     } catch {
       if (event.signal.aborted) return { cancel: true };

@@ -283,11 +283,12 @@ describe('Pi native compaction extension', () => {
       customType: 'fast-jev-pi-boundary',
       data: expect.objectContaining({ checkpointId: expect.any(String) }),
     });
-    expect(result.compaction.firstKeptEntryId).toBe(boundary.id);
+    expect(result.compaction.firstKeptEntryId).toBe(fixture.rootId);
 
     const details = result.compaction.details as AnyRecord;
     expect(details).toMatchObject({
-      format: 'fast-jev-pi-context-v1',
+      format: 'fast-jev-pi-context-v2',
+      sourceStartId: fixture.rootId,
       id: boundary.data.checkpointId,
       readFiles: ['reports/old.txt'],
       modifiedFiles: ['src/fix.ts'],
@@ -330,7 +331,7 @@ describe('Pi native compaction extension', () => {
     await command(harness, 'decisions');
     expect(harness.ctx.ui.notify).toHaveBeenLastCalledWith('Jev: no decisions yet', 'info');
     const nativeContext = contextMessages(harness.session);
-    expect(nativeContext).toHaveLength(1);
+    expect(nativeContext).toHaveLength(fixture.messages.length + 1);
     expect(nativeContext[0]).toMatchObject({ role: 'compactionSummary', summary: result.compaction.summary });
 
     const restored = await fire(harness, 'context', { type: 'context', messages: nativeContext }) as AnyRecord;
